@@ -15613,7 +15613,7 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             *total += heap.size;
 
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
-                *free += budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
+                *free += heap.size - budgetprops.heapUsage[i];
             } else {
                 *free += heap.size;
             }
