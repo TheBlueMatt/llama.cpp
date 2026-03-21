@@ -698,6 +698,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
+    // Shared memory staging variants (legacy quants + MXFP4 MMVQ)
+    vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32_shmem[GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+    vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32_shmem[GGML_TYPE_COUNT];
+
     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
@@ -4096,6 +4100,26 @@ static void ggml_vk_load_shaders(vk_device& device) {
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_S][i], "mul_mat_vec_iq1_s_q8_1_f32", arr_dmmv_iq1_s_q8_1_f32_len[reduc], arr_dmmv_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_M][i], "mul_mat_vec_iq1_m_q8_1_f32", arr_dmmv_iq1_m_q8_1_f32_len[reduc], arr_dmmv_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
 
+                // Shared memory staging variants (legacy quants + MXFP4)
+                if (device->vendor_id == VK_VENDOR_ID_INTEL) {
+                    const uint32_t shmem_wg_size = subgroup_size_int * 4;
+                    struct { ggml_type type; const char *name; uint64_t len; const void *data; uint32_t rm; } shmem_types[] = {
+                        { GGML_TYPE_Q4_0, "mul_mat_vec_q4_0_q8_1_f32_shmem_staging", mul_mat_vec_q4_0_q8_1_f32_shmem_staging_len, mul_mat_vec_q4_0_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                        { GGML_TYPE_Q4_1, "mul_mat_vec_q4_1_q8_1_f32_shmem_staging", mul_mat_vec_q4_1_q8_1_f32_shmem_staging_len, mul_mat_vec_q4_1_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                        { GGML_TYPE_Q5_0, "mul_mat_vec_q5_0_q8_1_f32_shmem_staging", mul_mat_vec_q5_0_q8_1_f32_shmem_staging_len, mul_mat_vec_q5_0_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                        { GGML_TYPE_Q5_1, "mul_mat_vec_q5_1_q8_1_f32_shmem_staging", mul_mat_vec_q5_1_q8_1_f32_shmem_staging_len, mul_mat_vec_q5_1_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                        { GGML_TYPE_Q8_0, "mul_mat_vec_q8_0_q8_1_f32_shmem_staging", mul_mat_vec_q8_0_q8_1_f32_shmem_staging_len, mul_mat_vec_q8_0_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                        { GGML_TYPE_MXFP4, "mul_mat_vec_mxfp4_q8_1_f32_shmem_staging", mul_mat_vec_mxfp4_q8_1_f32_shmem_staging_len, mul_mat_vec_mxfp4_q8_1_f32_shmem_staging_data, 2*rm_stdq_int },
+                    };
+                    for (const auto& st : shmem_types) {
+                        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32_shmem[st.type][i],
+                            st.name, st.len, st.data,
+                            "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants),
+                            {st.rm, 1, 1}, {shmem_wg_size, st.rm, i+1},
+                            1, true, true, subgroup_size_int);
+                    }
+                }
+
             }
 #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
         }
@@ -4145,6 +4169,26 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ1_S], "mul_mat_vec_id_iq1_s_q8_1_f32", arr_dmmv_id_iq1_s_q8_1_f32_len[reduc], arr_dmmv_id_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_iq_int(0), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(0)}, 1, true, use_subgroups, subgroup_size_int);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_IQ1_M], "mul_mat_vec_id_iq1_m_q8_1_f32", arr_dmmv_id_iq1_m_q8_1_f32_len[reduc], arr_dmmv_id_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_iq_int(0), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(0)}, 1, true, use_subgroups, subgroup_size_int);
+
+            // Shared memory staging variants (legacy quants + MXFP4 MUL_MAT_ID)
+            if (device->vendor_id == VK_VENDOR_ID_INTEL) {
+                const uint32_t shmem_wg_size = subgroup_size_int * 4;
+                struct { ggml_type type; const char *name; uint64_t len; const void *data; uint32_t rm; } shmem_id_types[] = {
+                    { GGML_TYPE_Q4_0, "mul_mat_vec_id_q4_0_q8_1_f32_shmem_staging", mul_mat_vec_id_q4_0_q8_1_f32_shmem_staging_len, mul_mat_vec_id_q4_0_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                    { GGML_TYPE_Q4_1, "mul_mat_vec_id_q4_1_q8_1_f32_shmem_staging", mul_mat_vec_id_q4_1_q8_1_f32_shmem_staging_len, mul_mat_vec_id_q4_1_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                    { GGML_TYPE_Q5_0, "mul_mat_vec_id_q5_0_q8_1_f32_shmem_staging", mul_mat_vec_id_q5_0_q8_1_f32_shmem_staging_len, mul_mat_vec_id_q5_0_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                    { GGML_TYPE_Q5_1, "mul_mat_vec_id_q5_1_q8_1_f32_shmem_staging", mul_mat_vec_id_q5_1_q8_1_f32_shmem_staging_len, mul_mat_vec_id_q5_1_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                    { GGML_TYPE_Q8_0, "mul_mat_vec_id_q8_0_q8_1_f32_shmem_staging", mul_mat_vec_id_q8_0_q8_1_f32_shmem_staging_len, mul_mat_vec_id_q8_0_q8_1_f32_shmem_staging_data, 1*rm_stdq_int },
+                    { GGML_TYPE_MXFP4, "mul_mat_vec_id_mxfp4_q8_1_f32_shmem_staging", mul_mat_vec_id_mxfp4_q8_1_f32_shmem_staging_len, mul_mat_vec_id_mxfp4_q8_1_f32_shmem_staging_data, 2*rm_stdq_int },
+                };
+                for (const auto& st : shmem_id_types) {
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32_shmem[st.type],
+                        st.name, st.len, st.data,
+                        "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants),
+                        {st.rm, 1, 1}, {shmem_wg_size, st.rm},
+                        1, true, true, subgroup_size_int);
+                }
+            }
         }
 #endif // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT
     }
@@ -6182,6 +6226,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+            if (ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32_shmem[a_type][num_cols-1]) {
+                return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32_shmem[a_type][num_cols-1];
+            }
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
@@ -6340,6 +6387,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+            if (ctx->device->pipeline_dequant_mul_mat_vec_id_q8_1_f32_shmem[a_type]) {
+                return ctx->device->pipeline_dequant_mul_mat_vec_id_q8_1_f32_shmem[a_type];
+            }
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
         return ctx->device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[dmmv_wg][a_type];

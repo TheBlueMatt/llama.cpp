@@ -27,6 +27,139 @@ vec2 cache_b_ds;
 
 #include "mul_mat_vecq_funcs.glsl"
 
+#if defined(USE_SHMEM_STAGING) && (defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4))
+// Shared memory staging for coalesced global loads on Intel Arc GPUs.
+// Instead of scattered 1-2 byte loads from global memory, we cooperatively
+// load A data into shared memory using coalesced 4-byte loads, then compute
+// from shared memory.
+
+// Block byte sizes and field offsets for each quantization type
+#if defined(DATA_A_Q4_0)
+#define SHMEM_BLOCK_BYTES 18u
+#define SHMEM_QS_OFFSET   2u
+#elif defined(DATA_A_Q4_1)
+#define SHMEM_BLOCK_BYTES 20u
+#define SHMEM_QS_OFFSET   4u
+#elif defined(DATA_A_Q5_0)
+#define SHMEM_BLOCK_BYTES 22u
+#define SHMEM_QH_OFFSET   2u
+#define SHMEM_QS_OFFSET   6u
+#elif defined(DATA_A_Q5_1)
+#define SHMEM_BLOCK_BYTES 24u
+#define SHMEM_QH_OFFSET   4u
+#define SHMEM_QS_OFFSET   8u
+#elif defined(DATA_A_Q8_0)
+#define SHMEM_BLOCK_BYTES 34u
+#define SHMEM_QS_OFFSET   2u
+#elif defined(DATA_A_MXFP4)
+#define SHMEM_BLOCK_BYTES 17u
+#define SHMEM_QS_OFFSET   1u
+#endif
+
+#define SHMEM_THREADS_PER_BLOCK (QUANT_K / K_PER_ITER)  // 32/8 = 4
+#define SHMEM_BLOCKS_PER_TILE (BLOCK_SIZE / SHMEM_THREADS_PER_BLOCK)
+#define SHMEM_TILE_K (SHMEM_BLOCKS_PER_TILE * QUANT_K)
+#define SHMEM_TILE_BYTES (SHMEM_BLOCKS_PER_TILE * SHMEM_BLOCK_BYTES)
+// +6 handles up to 3-byte misalignment + rounding to uint32
+#define SHMEM_U32_PER_ROW ((SHMEM_TILE_BYTES + 6u) / 4u)
+
+shared uint shmem_tile[NUM_ROWS * SHMEM_U32_PER_ROW];
+
+// Read 4 consecutive bytes from shmem at arbitrary byte alignment
+int32_t shmem_read_i32(uint byte_off, uint row) {
+    uint base = row * SHMEM_U32_PER_ROW;
+    uint w = byte_off >> 2u;
+    uint shift = (byte_off & 3u) << 3u;
+    if (shift == 0u) {
+        return int32_t(shmem_tile[base + w]);
+    } else {
+        return int32_t((shmem_tile[base + w] >> shift) | (shmem_tile[base + w + 1u] << (32u - shift)));
+    }
+}
+
+// Read float16 from shmem at arbitrary byte alignment
+float shmem_read_f16(uint byte_off, uint row) {
+    uint base = row * SHMEM_U32_PER_ROW;
+    uint w = byte_off >> 2u;
+    uint shift = (byte_off & 3u) << 3u;
+    uint raw;
+    if (shift <= 16u) {
+        raw = shmem_tile[base + w] >> shift;
+    } else {
+        raw = (shmem_tile[base + w] >> shift) | (shmem_tile[base + w + 1u] << (32u - shift));
+    }
+    return unpackHalf2x16(raw).x;
+}
+
+// --- Type-specific shmem access functions ---
+
+// shmem_get_dm: read scale/min from shared memory
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0)
+FLOAT_TYPE shmem_get_dm(uint blk_off, uint row) {
+    return FLOAT_TYPE(shmem_read_f16(blk_off, row));
+}
+#elif defined(DATA_A_Q4_1) || defined(DATA_A_Q5_1)
+FLOAT_TYPE_VEC2 shmem_get_dm(uint blk_off, uint row) {
+    return FLOAT_TYPE_VEC2(unpackHalf2x16(uint32_t(shmem_read_i32(blk_off, row))));
+}
+#elif defined(DATA_A_MXFP4)
+FLOAT_TYPE shmem_get_dm(uint blk_off, uint row) {
+    uint base = row * SHMEM_U32_PER_ROW;
+    uint w = blk_off >> 2u;
+    uint shift = (blk_off & 3u) << 3u;
+    return FLOAT_TYPE(e8m0_to_fp32(uint8_t((shmem_tile[base + w] >> shift) & 0xFFu)));
+}
+#endif
+
+// shmem_repack: read and unpack quants from shared memory
+#if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
+i32vec2 shmem_repack(uint blk_off, uint iqs, uint row) {
+    uint32_t vui = uint32_t(shmem_read_i32(blk_off + SHMEM_QS_OFFSET + iqs * 4u, row));
+    return i32vec2(vui & 0x0F0F0F0F, (vui >> 4u) & 0x0F0F0F0F);
+}
+#elif defined(DATA_A_Q5_0) || defined(DATA_A_Q5_1)
+i32vec2 shmem_repack(uint blk_off, uint iqs, uint row) {
+    int32_t qh = int32_t(uint32_t(shmem_read_i32(blk_off + SHMEM_QH_OFFSET, row)) >> (4u * iqs));
+    uint32_t vui = uint32_t(shmem_read_i32(blk_off + SHMEM_QS_OFFSET + iqs * 4u, row));
+    int32_t v0 = int32_t(vui & 0x0F0F0F0F)
+               | ((qh & 0xF) * 0x02040810) & 0x10101010;
+    int32_t v1 = int32_t((vui >> 4u) & 0x0F0F0F0F)
+               | (((qh >> 16) & 0xF) * 0x02040810) & 0x10101010;
+    return i32vec2(v0, v1);
+}
+#elif defined(DATA_A_Q8_0)
+int32_t shmem_repack(uint blk_off, uint iqs, uint row) {
+    return shmem_read_i32(blk_off + SHMEM_QS_OFFSET + iqs * 4u, row);
+}
+#elif defined(DATA_A_MXFP4)
+i32vec2 shmem_repack(uint blk_off, uint iqs, uint row) {
+    uint32_t qs_raw = uint32_t(shmem_read_i32(blk_off + SHMEM_QS_OFFSET + iqs * 4u, row));
+    const u8vec4 i_a0 = unpack8( qs_raw        & 0x0F0F0F0Fu);
+    const u8vec4 i_a1 = unpack8((qs_raw >> 4u) & 0x0F0F0F0Fu);
+    return i32vec2(
+        pack32(i8vec4(kvalues_mxfp4[i_a0.x], kvalues_mxfp4[i_a0.y], kvalues_mxfp4[i_a0.z], kvalues_mxfp4[i_a0.w])),
+        pack32(i8vec4(kvalues_mxfp4[i_a1.x], kvalues_mxfp4[i_a1.y], kvalues_mxfp4[i_a1.z], kvalues_mxfp4[i_a1.w])));
+}
+#endif
+
+// Generic shmem dot product (mirrors mmvq_dot_product but reads from shmem)
+FLOAT_TYPE shmem_mmvq_dot_product(uint blk_off, uint iqs, uint row) {
+    int32_t q_sum = 0;
+#if QUANT_R == 2
+    const i32vec2 data_a_qs = shmem_repack(blk_off, iqs, row);
+    q_sum += dotPacked4x8EXT(data_a_qs.x, cache_b_qs[0]);
+    q_sum += dotPacked4x8EXT(data_a_qs.y, cache_b_qs[1]);
+#else
+    int32_t data_a_qs = shmem_repack(blk_off, iqs * 2, row);
+    q_sum += dotPacked4x8EXT(data_a_qs, cache_b_qs[0]);
+    data_a_qs = shmem_repack(blk_off, iqs * 2 + 1, row);
+    q_sum += dotPacked4x8EXT(data_a_qs, cache_b_qs[1]);
+#endif
+    return mul_q8_1(q_sum, shmem_get_dm(blk_off, row), cache_b_ds, 4);
+}
+
+#endif // USE_SHMEM_STAGING && (DATA_A_QUANT_LEGACY || DATA_A_MXFP4)
+
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         const uint col = i*BLOCK_SIZE + tid*K_PER_ITER;
@@ -83,12 +216,72 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     b_offset /= QUANT_K_Q8_1;
 
     FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
-
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             temp[j][n] = FLOAT_TYPE(0.0f);
         }
     }
+
+#if defined(USE_SHMEM_STAGING) && (defined(DATA_A_QUANT_LEGACY) || defined(DATA_A_MXFP4))
+    // Shared memory staging: tile-based iteration with coalesced loads
+
+    uint row_base_block[NUM_ROWS];
+    uint row_align[NUM_ROWS];
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        row_base_block[n] = (first_row + n) * (p.ncols / QUANT_K) + a_offset;
+        row_align[n] = (row_base_block[n] * SHMEM_BLOCK_BYTES) & 3u;
+    }
+
+    const uint total_blocks_per_row = p.ncols / QUANT_K;
+    const uint num_tiles = (total_blocks_per_row + SHMEM_BLOCKS_PER_TILE - 1u) / SHMEM_BLOCKS_PER_TILE;
+
+    for (uint tile = 0u; tile < num_tiles; ++tile) {
+        const uint blocks_remaining = total_blocks_per_row - tile * SHMEM_BLOCKS_PER_TILE;
+        const uint blocks_in_tile = min(blocks_remaining, SHMEM_BLOCKS_PER_TILE);
+
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint first_block = row_base_block[n] + tile * SHMEM_BLOCKS_PER_TILE;
+            const uint load_u32 = (first_block * SHMEM_BLOCK_BYTES) >> 2u;
+            const uint base = n * SHMEM_U32_PER_ROW;
+            const uint u32_count = (blocks_in_tile * SHMEM_BLOCK_BYTES + row_align[n] + 3u) >> 2u;
+
+            for (uint idx = tid; idx < u32_count; idx += BLOCK_SIZE) {
+                shmem_tile[base + idx] = data_a_u32[load_u32 + idx];
+            }
+        }
+
+        barrier();
+
+        const uint global_col = tile * SHMEM_TILE_K + tid * K_PER_ITER;
+        if (global_col < p.ncols) {
+            const uint block_in_tile = tid / SHMEM_THREADS_PER_BLOCK;
+            const uint iqs = tid % SHMEM_THREADS_PER_BLOCK;
+
+            [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+                const uint b_block_idx = (j * p.batch_stride_b + global_col) / QUANT_K_Q8_1 + b_offset;
+                const uint b_block_idx_outer = b_block_idx / 4;
+                const uint b_block_idx_inner = b_block_idx % 4;
+                cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+#if QUANT_R == 2
+                cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + iqs];
+                cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + iqs + 4];
+#else
+                cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + iqs * 2];
+                cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + iqs * 2 + 1];
+#endif
+
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    const uint blk_off = row_align[n] + block_in_tile * SHMEM_BLOCK_BYTES;
+                    temp[j][n] += shmem_mmvq_dot_product(blk_off, iqs, n);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+#else
+    // Standard iteration with direct global memory access
 
     uint num_iters = p.ncols / (K_PER_ITER * BLOCK_SIZE);
     if (num_iters * K_PER_ITER * BLOCK_SIZE + K_PER_ITER*tid < p.ncols) {
@@ -99,7 +292,6 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 
     uint i = 0;
     while (i < unrolled_iters) {
-        // Manually partially unroll the loop
         [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
             iter(temp, first_row, num_rows, tid, i*K_PER_ITER);
             i++;
@@ -110,7 +302,6 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     unrolled_iters = num_iters & ~(unroll_count - 1);
 
     while (i < unrolled_iters) {
-        // Manually partially unroll the loop
         [[unroll]] for (uint k = 0; k < unroll_count; ++k) {
             iter(temp, first_row, num_rows, tid, i*K_PER_ITER);
             i++;
@@ -120,6 +311,8 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
         iter(temp, first_row, num_rows, tid, i*K_PER_ITER);
         i++;
     }
+
+#endif
 
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
