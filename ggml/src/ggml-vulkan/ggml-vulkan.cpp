@@ -439,10 +439,11 @@ struct vk_fa_pipeline_state {
     uint32_t limit_occupancy_shmem;
     ggml_type k_type;
     ggml_type v_type;
+    uint32_t MatBr, MatBc;  // coopmat tile dims: MatBr=N, MatBc=M
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, MatBr, MatBc) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.MatBr, b.MatBc);
     }
 };
 
@@ -3096,13 +3097,15 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
 
     const uint32_t D = hsk | hsv;
 
-    const uint32_t coopmat_block_rows = 16;
-    const uint32_t coopmat_block_cols = 16;
+    // MatBc is coopmat M dimension (A rows), MatBr is N dimension (B cols).
+    // Intel Xe2: M=8, N=16. NVIDIA: M=N=16.
+    const uint32_t MatBr = device->coopmat_n;  // N dimension
+    const uint32_t MatBc = device->coopmat_m;  // M dimension
 
     const uint32_t num_subgroups = 4;
 
-    result.block_rows = coopmat_block_rows;
-    result.block_cols = coopmat_block_cols * num_subgroups;
+    result.block_rows = MatBr;
+    result.block_cols = MatBc * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
     result.workgroup_size = num_subgroups * result.subgroup_size;
@@ -3153,8 +3156,8 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     }
 
     if (path == FA_COOPMAT1) {
-        bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
-                        (!f32acc && device->coopmat_support_16x16x16_f16acc);
+        bool shape_ok = (f32acc && device->coopmat_acc_f32_support) ||
+                        (!f32acc && device->coopmat_acc_f16_support);
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc);
 
@@ -3181,7 +3184,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     case FA_COOPMAT2:
         return get_fa_tuning_params_coopmat2(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
     default:
-        throw std::runtime_error("unsupported FaCodePath");
+        GGML_ABORT("Invalid FA code path");
     }
 }
 
@@ -3197,7 +3200,9 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    const uint32_t matbr = (params.path == FA_COOPMAT1 && device->coopmat_n > 0) ? device->coopmat_n : 16;
+    const uint32_t matbc = (params.path == FA_COOPMAT1 && device->coopmat_m > 0) ? device->coopmat_m : 16;
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, matbr, matbc};
 }
 
 static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& state) {
@@ -3222,6 +3227,8 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*13 FaTypeV         */ static_cast<uint32_t>(state.v_type),
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
+        /*16 MatBr           */ state.MatBr,
+        /*17 MatBc           */ state.MatBc,
     };
 }
 
@@ -9223,7 +9230,9 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
 
-    const uint32_t MatBr = 16, MatBc = 16;
+    // Must match the actual coopmat tile dimensions used by the shader
+    const uint32_t MatBr = device->coopmat_n > 0 ? device->coopmat_n : 16;
+    const uint32_t MatBc = device->coopmat_m > 0 ? device->coopmat_m : 16;
 
     const uint32_t row_split = Bc / MatBc;
 
@@ -9245,11 +9254,11 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t sfsh = Bc * sfshstride * acctype;
 
     const uint32_t kvshstride = (params.shmem_staging ? std::max(hsk_pad, hsv_pad) : MatBr) / 4 + 2;
-    const uint32_t vsh_stride = MatBc / 4 * row_split;
+    const uint32_t vsh_stride = MatBr / 4 * row_split;
     const uint32_t ksh = ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
 
     const uint32_t osh_stride = params.row_split * MatBr / 4;
-    const uint32_t pvsh = MatBc * osh_stride * f16vec4;
+    const uint32_t pvsh = Br * osh_stride * f16vec4;
 
     const uint32_t slope = Br * acctype;
 
