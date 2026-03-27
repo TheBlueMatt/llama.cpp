@@ -15,9 +15,11 @@
 #include "types.glsl"
 #include "flash_attn_base.glsl"
 
-// These need to be supported N,M values for a MatBc x MatBr x 16 coopmatmuladd
-const uint32_t MatBr = 16;
-const uint32_t MatBc = 16;
+// Cooperative matrix tile dimensions. MatBc is the M dimension (rows of A/KMat),
+// MatBr is the N dimension (cols of B/QMat). Must match hardware coopmat shape.
+// NVIDIA: MatBr=16, MatBc=16. Intel Xe2: MatBr=16, MatBc=8.
+layout (constant_id = 12) const uint32_t MatBr = 16;
+layout (constant_id = 13) const uint32_t MatBc = 16;
 
 const uint32_t rows_per_thread = Br / row_split;
 const uint32_t cols_per_iter = gl_WorkGroupSize.x / row_split;
@@ -46,12 +48,16 @@ shared ACC_TYPEV4 sfsh[Bc * sfshstride];
 
 const uint32_t D_pad = HSK_pad > HSV_pad ? HSK_pad : HSV_pad;
 const uint32_t kvsh_stride = (SHMEM_STAGING != 0 ? D_pad : MatBr) / 4 + 2; // in units of f16vec4
-const uint v_cols = MatBc / 4 * row_split; // total cols, 4 vec4s per MatBc * number of subgroups
+// Each subgroup loads a coopmat B tile with MatBr/4 vec4 columns.
+// When MatBc != MatBr (e.g. Intel 8x16), v_cols must use MatBr, not MatBc.
+const uint v_cols = MatBr / 4 * row_split;
 const uint vsh_stride = v_cols;
 shared f16vec4 kvsh[(kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride)];
 
 const uint32_t osh_stride = row_split * MatBr / 4;
-shared f16vec4 pvsh[MatBc * osh_stride];
+// pvsh holds Br rows (not just MatBc) so the PV query tile loop can store
+// all tiles before a single barrier+readback, instead of barrier per tile.
+shared f16vec4 pvsh[Br * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
@@ -413,7 +419,8 @@ void main() {
         }
         barrier();
 
-        const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
+        const uint hsv_tile_size = v_cols * 4; // fp16 values per hsv tile
+        const uint num_hsv_tiles = (HSV + hsv_tile_size - 1) / hsv_tile_size; // round up
 
         // Each subgroup handles HSV/4 columns
         [[unroll]] for (uint32_t hsv_tile = 0; hsv_tile < num_hsv_tiles; ++hsv_tile) {
@@ -441,7 +448,7 @@ void main() {
                 const uint col = idx % v_cols;
 
                 const uint v_row = j * Bc + row;
-                const uint v_col = hsv_tile * MatBc * row_split + col * 4;
+                const uint v_col = hsv_tile * v_cols * 4 + col * 4;
 
                 const uint coord = v_row * v_stride * BLOCK_SIZE + v_col;
                 const uint ib = coord / BLOCK_SIZE;
@@ -466,44 +473,58 @@ void main() {
 
             const uint o_offset = gl_SubgroupID * MatBr / 4;
 
-            if (hsv_offset < HSV_pad) {
-                [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / MatBc; ++bc_chunk) {
-                    coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+            // The coopmat K dimension is always 16 (hardware FP16 systolic depth).
+            // The PV multiply sums over keys, so we step by 16 keys at a time.
+            // When MatBc < Br (e.g. Intel Xe2: MatBc=8, Br=16), we also need to
+            // tile over queries since each coopmat only covers MatBc query rows.
+            const uint32_t pv_K = 16;
+            const uint32_t q_tiles = Br / MatBc;
 
-                    if (SHMEM_STAGING == 0) {
-#if BLOCK_SIZE == 1
-                    if (!KV_bounds_check) {
-                        // F16 values can be loaded directly from global memory
-                        const uint v_tile_row = j * Bc + bc_chunk * MatBc;
-                        const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
-                        coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
-                    } else
-#endif
-                    {
-                        const uint v_tile_offset = bc_chunk * MatBr * v_cols + gl_SubgroupID * (MatBc / 4);
-                        coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
-                    }
-                    } else {
-                        const uint v_tile_offset = bc_chunk * MatBc * kvsh_stride + (hsv_tile * row_split + gl_SubgroupID) * (MatBc / 4);
-                        coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
-                    }
-
-                    PVMat = coopMatMulAdd(KMat, QMat, PVMat);
-                }
-
-                // Store PVMat to pvsh and load into Of
-                coopMatStore(PVMat, pvsh, o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
-            }
-
-            barrier();
-
-            const uint hsv_per_tile = row_split * MatBc;
+            const uint hsv_per_tile = hsv_tile_size;
             const uint hsv_base = hsv_tile * hsv_per_tile;
             const uint d_values_per_tile = hsv_per_tile / 4;
 
             const uint d_start = hsv_tile * d_values_per_tile;
             const uint d_end = min(d_start + d_values_per_tile, HSV / 4);
 
+            // Compute PV for all query tiles, storing each to its own pvsh region.
+            // pvsh is sized for Br rows (not just MatBc), so all tiles fit.
+            [[unroll]] for (uint32_t q_tile = 0; q_tile < q_tiles; ++q_tile) {
+                if (hsv_offset < HSV_pad) {
+                    PVMat = coopmat<float16_t, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0);
+
+                    [[unroll]] for (uint32_t bc_chunk = 0; bc_chunk < Bc / pv_K; ++bc_chunk) {
+                        coopMatLoad(KMat, Psh, bc_chunk * pv_K * psh_stride + q_tile * (MatBc / 4), psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+
+                        if (SHMEM_STAGING == 0) {
+#if BLOCK_SIZE == 1
+                        if (!KV_bounds_check) {
+                            const uint v_tile_row = j * Bc + bc_chunk * pv_K;
+                            const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
+                            coopMatLoad(QMat, data_vv4, v_tile_offset, v_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                        } else
+#endif
+                        {
+                            const uint v_tile_offset = bc_chunk * pv_K * vsh_stride + gl_SubgroupID * (MatBr / 4);
+                            coopMatLoad(QMat, kvsh, v_tile_offset, vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                        }
+                        } else {
+                            const uint v_tile_offset = bc_chunk * pv_K * kvsh_stride + (hsv_tile * row_split + gl_SubgroupID) * (MatBr / 4);
+                            coopMatLoad(QMat, kvsh, v_tile_offset, kvsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                        }
+
+                        PVMat = coopMatMulAdd(KMat, QMat, PVMat);
+                    }
+
+                    // Store this query tile's results at its own offset in pvsh
+                    coopMatStore(PVMat, pvsh, q_tile * MatBc * osh_stride + o_offset, osh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+
+            // Single barrier after all tiles are stored
+            barrier();
+
+            // Read back all query tiles from pvsh into Of
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 const uint row = tile_row(r);
 
