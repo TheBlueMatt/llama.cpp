@@ -6998,7 +6998,15 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     ggml_vk_sync_buffers(nullptr, subctx);
     subctx->s->buffer->buf.copyBuffer(src->buffer, staging_buffer->buffer, slices);
 
-    deferred_memcpy(dst, staging_buffer->ptr, copy_size, &subctx->out_memcpys);
+    if (width == dpitch) {
+        deferred_memcpy(dst, staging_buffer->ptr, copy_size, &subctx->out_memcpys);
+    } else {
+        // When destination stride differs from width, copy only the valid
+        // bytes per row to avoid writing into regions owned by other buffers.
+        for (size_t i = 0; i < height; i++) {
+            deferred_memcpy((char *)dst + i * dpitch, (char *)staging_buffer->ptr + i * dpitch, width, &subctx->out_memcpys);
+        }
+    }
     return true;
 }
 
@@ -13649,6 +13657,43 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
     UNUSED(buffer);
 }
 
+static void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    VK_LOG_DEBUG("ggml_backend_vk_buffer_get_tensor_2d(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ", n=" << n_copies << ")");
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+
+    if (size == 0 || n_copies == 0) {
+        return;
+    }
+
+    vk_buffer buf = buf_ctx->dev_buffer;
+    const size_t base_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+
+    if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && buf->device->uma) {
+        GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy((char *)data + i * stride_data, (uint8_t *)buf->ptr + base_offset + i * stride_tensor, size);
+        }
+    } else {
+        std::lock_guard<std::recursive_mutex> guard(buf->device->mutex);
+
+        vk_context subctx = ggml_vk_create_temporary_context(buf->device->transfer_queue.cmd_pool);
+        ggml_vk_ctx_begin(buf->device, subctx);
+        bool ret = ggml_vk_buffer_read_2d_async(subctx, buf, base_offset, data, stride_tensor, stride_data, size, n_copies, true);
+        GGML_ASSERT(ret);
+        ggml_vk_ctx_end(subctx);
+
+        ggml_vk_submit(subctx, buf->device->fence);
+        VK_CHECK(buf->device->device.waitForFences({ buf->device->fence }, true, UINT64_MAX), "vk_buffer_get_tensor_2d waitForFences");
+        buf->device->device.resetFences({ buf->device->fence });
+        ggml_vk_queue_command_pools_cleanup(buf->device);
+
+        for (auto& cpy : subctx->out_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+    }
+}
+
 static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
@@ -13663,7 +13708,7 @@ static ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
     /* .set_tensor      = */ ggml_backend_vk_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_vk_buffer_get_tensor,
     /* .set_tensor_2d   = */ NULL,
-    /* .get_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ ggml_backend_vk_buffer_get_tensor_2d,
     /* .cpy_tensor      = */ ggml_backend_vk_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_vk_buffer_clear,
     /* .reset           = */ NULL,
