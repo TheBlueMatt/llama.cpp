@@ -480,7 +480,21 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     if (it == stc.simple_tensors.end()) {
         return nullptr;
     }
-    return it->second[index];
+    ggml_tensor * result = it->second[index];
+    if (result && result->buffer && (ggml_backend_buffer_is_meta(result->buffer) || ggml_backend_buffer_is_multi_buffer(result->buffer))) {
+        // The per-device allocation (ggml_backend_meta_alloc_ctx_tensors_from_buft)
+        // may wrap individual backend buffers in a multi-buffer.  View tensors inherit
+        // their view_src's buffer via ggml_backend_view_init.  When the view_src lives
+        // in an allocation that was split across multiple backend buffers, the view
+        // gets the multi-buffer rather than the concrete backend buffer.  Resolve it
+        // by using the view_src's actual buffer.
+        if (result->view_src && result->view_src->buffer &&
+                !ggml_backend_buffer_is_meta(result->view_src->buffer) &&
+                !ggml_backend_buffer_is_multi_buffer(result->view_src->buffer)) {
+            result->buffer = result->view_src->buffer;
+        }
+    }
+    return result;
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
