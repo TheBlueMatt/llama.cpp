@@ -54,6 +54,10 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <future>
 #include <thread>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
@@ -605,6 +609,8 @@ struct vk_device_struct {
     uint64_t suballocation_block_size;
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
+    bool external_memory_fd {};
+    bool external_semaphore_fd {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -872,6 +878,20 @@ struct vk_device_struct {
     vk::Fence fence;
     vk_buffer sync_staging;
 
+    // Timeline semaphore used by ggml_backend_vk_allreduce_tensor for GPU-side
+    // cross-device synchronization via VK_KHR_external_semaphore_fd. The semaphore
+    // is created exportable and imported on peer devices so allreduce command
+    // buffers can wait on peers' completion without CPU fence waits.
+    vk::Semaphore allreduce_tl_sema;
+    uint64_t allreduce_tl_value = 0;
+    // Imported copies of peer devices' timeline semaphores, keyed by peer device idx.
+    std::unordered_map<size_t, vk::Semaphore> allreduce_peer_semas;
+    // Per-device scratch buffer used as the alternate destination in the
+    // allreduce ping-pong: round 0 writes scratch, round 1 writes local, etc.
+    // Avoids a cross-device race where peer j reads our buffer while we write
+    // to it in the same round.
+    vk_buffer allreduce_scratch;
+
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
@@ -887,6 +907,15 @@ struct vk_device_struct {
         device.destroyFence(fence);
 
         ggml_vk_destroy_buffer(sync_staging);
+        ggml_vk_destroy_buffer(allreduce_scratch);
+
+        for (auto& [peer_idx, sema] : allreduce_peer_semas) {
+            device.destroySemaphore(sema);
+        }
+        allreduce_peer_semas.clear();
+        if (allreduce_tl_sema) {
+            device.destroySemaphore(allreduce_tl_sema);
+        }
 
         compute_queue.cmd_pool.destroy(device);
         transfer_queue.cmd_pool.destroy(device);
@@ -923,6 +952,19 @@ void vk_command_pool::destroy(vk::Device& device) {
     cmd_buffers.clear();
 }
 
+// Forward declared so vk_buffer_struct can hold a list of imports on peer devices.
+struct vk_device_struct;
+
+// A view of this buffer's memory imported onto a peer device via
+// VK_KHR_external_memory_fd. The buffer and memory handles below live on
+// `peer_device`, not on the device that owns the source vk_buffer_struct.
+struct vk_buffer_peer_import {
+    vk_device_struct * peer_device;  // raw pointer; lifetime is bounded by the source buffer
+    vk::Buffer         buffer;
+    vk::DeviceMemory   memory;
+    vk::DeviceSize     size;
+};
+
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
@@ -933,11 +975,26 @@ struct vk_buffer_struct {
 
     vk_device device;
 
+    // Peer-device imports that alias this buffer's memory via VK_KHR_external_memory_fd.
+    // Stored here rather than on the peer device so that destroying the source buffer
+    // also destroys the imports, keeping the cache free of stale entries.
+    std::vector<vk_buffer_peer_import> peer_imports;
+    std::mutex peer_imports_mutex;
+
     ~vk_buffer_struct() {
         if (size == 0) {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+
+        // Free peer imports before the source memory goes away. Each import's buffer
+        // and memory live on the peer_device; we acquire the peer device handle
+        // directly from the import entry.
+        for (auto & imp : peer_imports) {
+            imp.peer_device->device.destroyBuffer(imp.buffer);
+            imp.peer_device->device.freeMemory(imp.memory);
+        }
+        peer_imports.clear();
 
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
@@ -2671,6 +2728,13 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     if (import_ptr) {
         external_memory_bci.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
         buffer_create_info.setPNext(&external_memory_bci);
+#ifndef _WIN32
+    } else if (device->external_memory_fd) {
+        // Mark the buffer as exportable so peer devices can import its backing
+        // memory via VK_KHR_external_memory_fd for direct P2P copies.
+        external_memory_bci.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+        buffer_create_info.setPNext(&external_memory_bci);
+#endif
     }
 
     buf->buffer = device->device.createBuffer(buffer_create_info);
@@ -2745,7 +2809,16 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
             for (auto mtype_it = memory_type_indices.begin(); mtype_it != memory_type_indices.end(); mtype_it++) {
                 try {
-                    buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
+                    vk::MemoryAllocateInfo alloc_info{ mem_req.size, *mtype_it, &mem_flags_info };
+#ifndef _WIN32
+                    vk::ExportMemoryAllocateInfo export_info;
+                    if (device->external_memory_fd) {
+                        export_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+                        export_info.setPNext(&mem_flags_info);
+                        alloc_info.setPNext(&export_info);
+                    }
+#endif
+                    buf->device_memory = device->device.allocateMemory(alloc_info);
                     done = true;
                     break;
                 } catch (const vk::SystemError& e) {
@@ -4972,6 +5045,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
+#ifndef _WIN32
+            } else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
+                device->external_memory_fd = true;
+            } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
+                device->external_semaphore_fd = true;
+#endif
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -5270,6 +5349,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (device->external_memory_host) {
             device_extensions.push_back("VK_EXT_external_memory_host");
         }
+#ifndef _WIN32
+        if (device->external_memory_fd) {
+            device_extensions.push_back("VK_KHR_external_memory_fd");
+        }
+        if (device->external_semaphore_fd) {
+            device_extensions.push_back("VK_KHR_external_semaphore_fd");
+        }
+#endif
 
 #if defined(VK_EXT_shader_64bit_indexing)
         VkPhysicalDeviceShader64BitIndexingFeaturesEXT shader_64bit_indexing_features {};
@@ -14007,6 +14094,645 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
+#ifndef _WIN32
+// Import `src_buf`'s backing memory onto `dst_dev` via VK_KHR_external_memory_fd.
+// The returned vk::Buffer is a buffer on dst_dev that aliases the same physical memory
+// as src_buf. Imports are cached on the source vk_buffer itself (peer_imports), so the
+// lifetime of the cached view is tied to the source buffer — if src_buf is destroyed,
+// its destructor cleans up all peer imports and the cache can never go stale.
+//
+// Returns vk::Buffer{} on failure. Caller must have already verified that
+// VK_KHR_external_memory_fd is present on both devices.
+static vk::Buffer ggml_vk_get_or_import_peer_buffer(vk_buffer& src_buf, vk_device_struct * dst_dev) {
+    GGML_ASSERT(src_buf->device.get() != dst_dev);
+    GGML_ASSERT(src_buf->device->external_memory_fd && dst_dev->external_memory_fd);
+
+    std::lock_guard<std::mutex> guard(src_buf->peer_imports_mutex);
+
+    for (auto & imp : src_buf->peer_imports) {
+        if (imp.peer_device == dst_dev) {
+            return imp.buffer;
+        }
+    }
+
+    int mem_fd = -1;
+    vk::Buffer       new_buf {};
+    vk::DeviceMemory new_mem {};
+    try {
+        // Export the source device's memory as an opaque file descriptor.
+        // Each call to getMemoryFdKHR returns a new fd that must be closed; we close
+        // it as soon as we've consumed it with ImportMemoryFdInfoKHR (which dup's it).
+        vk::MemoryGetFdInfoKHR get_fd_info{ src_buf->device_memory, vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd };
+        mem_fd = src_buf->device->device.getMemoryFdKHR(get_fd_info);
+
+        // Build a matching buffer object on the destination device.
+        vk::ExternalMemoryBufferCreateInfo ext_bci{ vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd };
+        vk::BufferCreateInfo bci{
+            vk::BufferCreateFlags(),
+            src_buf->size,
+            vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+            vk::SharingMode::eExclusive, 0, nullptr,
+        };
+        bci.setPNext(&ext_bci);
+        new_buf = dst_dev->device.createBuffer(bci);
+
+        vk::MemoryRequirements mem_req = dst_dev->device.getBufferMemoryRequirements(new_buf);
+        vk::PhysicalDeviceMemoryProperties mem_props = dst_dev->physical_device.getMemoryProperties();
+
+        uint32_t mem_type_idx = UINT32_MAX;
+        for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+            if (mem_req.memoryTypeBits & (1u << i)) {
+                mem_type_idx = i;
+                break;
+            }
+        }
+        if (mem_type_idx == UINT32_MAX) {
+            dst_dev->device.destroyBuffer(new_buf);
+            close(mem_fd);
+            return vk::Buffer{};
+        }
+
+        vk::ImportMemoryFdInfoKHR  import_info{ vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd, mem_fd };
+        vk::MemoryAllocateInfo     alloc_info{ mem_req.size, mem_type_idx };
+        alloc_info.setPNext(&import_info);
+
+        new_mem = dst_dev->device.allocateMemory(alloc_info);
+        // ImportMemoryFdInfoKHR transfers ownership of the fd to Vulkan on success,
+        // so we must NOT close it after allocateMemory returns.
+        mem_fd = -1;
+
+        dst_dev->device.bindBufferMemory(new_buf, new_mem, 0);
+    } catch (const vk::SystemError& e) {
+        VK_LOG_DEBUG("P2P peer import failed: " << e.what());
+        if (new_buf) { dst_dev->device.destroyBuffer(new_buf); }
+        if (new_mem) { dst_dev->device.freeMemory(new_mem); }
+        if (mem_fd >= 0) { close(mem_fd); }
+        return vk::Buffer{};
+    }
+
+    src_buf->peer_imports.push_back({ dst_dev, new_buf, new_mem, src_buf->size });
+    return new_buf;
+}
+
+// Set up exportable timeline semaphores on each device and import them on peer devices
+// for GPU-side cross-device synchronization in the allreduce path. Idempotent and
+// caches results on each device. Caller must have already verified that
+// VK_KHR_external_semaphore_fd is present on every device. Returns false on driver
+// error so the caller can defer to the meta backend's generic allreduce.
+static bool ggml_vk_setup_allreduce_semaphores(
+    std::vector<ggml_backend_vk_context *>& ctxs, size_t n_backends)
+{
+    // Create exportable timeline semaphore on each device that doesn't have one yet.
+    for (size_t j = 0; j < n_backends; j++) {
+        auto & dev = ctxs[j]->device;
+        GGML_ASSERT(dev->external_semaphore_fd);
+        if (dev->allreduce_tl_sema) {
+            continue;  // already created
+        }
+        try {
+            vk::ExportSemaphoreCreateInfo esci;
+            esci.handleTypes = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;
+            vk::SemaphoreTypeCreateInfo stci{ vk::SemaphoreType::eTimeline, 0 };
+            stci.pNext = &esci;
+            vk::SemaphoreCreateInfo sci{};
+            sci.pNext = &stci;
+            dev->allreduce_tl_sema = dev->device.createSemaphore(sci);
+            dev->allreduce_tl_value = 0;
+        } catch (const vk::SystemError& e) {
+            VK_LOG_DEBUG("allreduce semaphore creation failed: " << e.what());
+            return false;
+        }
+    }
+
+    // Import each device's semaphore on all peer devices.
+    for (size_t j = 0; j < n_backends; j++) {
+        auto & src_dev = ctxs[j]->device;
+        for (size_t k = 0; k < n_backends; k++) {
+            if (k == j) {
+                continue;
+            }
+            auto & dst_dev = ctxs[k]->device;
+            if (dst_dev->allreduce_peer_semas.count(src_dev->idx)) {
+                continue;  // already imported
+            }
+            try {
+                // Export fd from source device
+                vk::SemaphoreGetFdInfoKHR gfi;
+                gfi.semaphore = src_dev->allreduce_tl_sema;
+                gfi.handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;
+                int fd = src_dev->device.getSemaphoreFdKHR(gfi);
+
+                // Create a timeline semaphore on the destination device and import the fd
+                vk::SemaphoreTypeCreateInfo stci{ vk::SemaphoreType::eTimeline, 0 };
+                vk::SemaphoreCreateInfo sci{};
+                sci.pNext = &stci;
+                vk::Semaphore imported_sema = dst_dev->device.createSemaphore(sci);
+
+                vk::ImportSemaphoreFdInfoKHR ifi;
+                ifi.semaphore = imported_sema;
+                ifi.handleType = vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;
+                ifi.fd = fd;
+                // Permanent import: semaphore payload persists across waits.
+                ifi.flags = {};
+                dst_dev->device.importSemaphoreFdKHR(ifi);
+                // fd ownership transferred to Vulkan on success.
+
+                dst_dev->allreduce_peer_semas[src_dev->idx] = imported_sema;
+            } catch (const vk::SystemError& e) {
+                VK_LOG_DEBUG("allreduce semaphore import failed: " << e.what());
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Vulkan-native AllReduce for tensor parallelism. Called by the meta backend via
+// get_proc_address("ggml_backend_allreduce_tensor"). After this function returns,
+// every tensors[j] contains the sum of all tensors[0..n-1].
+//
+// Strategy: recursive doubling with log2(n) rounds, one compute dispatch per
+// round. Each dispatch is a direct-P2P add that reads our src and peer's src
+// and writes our dst, ping-ponging between the tensor's own buffer (`local`)
+// and a per-device `allreduce_scratch`:
+//   round 0: read local, read peer.local,   write scratch
+//   round 1: read scratch, read peer.scratch, write local
+//   (alternates; odd-n_rounds cases append one final scratch->local copy)
+//
+// Race-freedom, three hazards:
+//   RAW: peer's round-r src is stable in round r (peer writes dst, not src),
+//        and was last written by peer in round r-1 — wait on peer's round-
+//        (r-1) signal (or compute-done for r=0).
+//   Self: same-queue cross-submit-batch ordering is NOT implicit; wait on
+//        our own tl_sema at the prior stage so round r's read of our src
+//        sees round r-1's write.
+//   WAR (cross-device): our dst in round r is the same buffer (by parity)
+//        that the ROUND r-1 peer (j ^ 2^(r-1), not the round-r peer) read
+//        from us in round r-1. Wait on that peer's round-(r-1) signal to
+//        avoid clobbering its still-in-flight P2P read. Missing this wait
+//        is timing-dependent silent corruption that passes test-backend-ops.
+//
+// Compared to the prior copy+add scheme this halves the per-round command
+// buffer count and semaphore signals (and removes an intermediate scratch
+// write of the peer data), which is a major win for small-payload tg
+// (Qwen 4-GPU tensor-split tg ~+50%).
+//
+// Only f32, contiguous tensors with identical shapes are supported. For anything else
+// we return false so the meta backend can fall back to its generic implementation.
+bool ggml_backend_vk_allreduce_tensor(ggml_backend_t * backends, ggml_tensor ** tensors, size_t n_backends) {
+    if (n_backends < 2) {
+        return false;
+    }
+    // Only power-of-two device counts for recursive doubling.
+    if ((n_backends & (n_backends - 1)) != 0) {
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensors[0]);
+    if (nbytes == 0) {
+        return true;
+    }
+    if (tensors[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    for (size_t j = 0; j < n_backends; j++) {
+        if (!ggml_backend_is_vk(backends[j])) {
+            return false;
+        }
+        if (tensors[j]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguously_allocated(tensors[j])) {
+            return false;
+        }
+        if (ggml_nbytes(tensors[j]) != nbytes) {
+            return false;
+        }
+        if (!ggml_backend_buffer_is_vk(tensors[j]->buffer)) {
+            return false;
+        }
+    }
+
+    std::vector<ggml_backend_vk_context *> ctxs(n_backends);
+    std::vector<vk_buffer *>                src_bufs(n_backends);
+    std::vector<size_t>                     src_offs(n_backends);
+    for (size_t j = 0; j < n_backends; j++) {
+        ctxs[j] = (ggml_backend_vk_context *) backends[j]->context;
+        // Require both extensions on every device. Without them we'd need a
+        // CPU-sync fallback path; defer to the meta backend's generic
+        // allreduce_fallback instead.
+        if (!ctxs[j]->device->external_memory_fd || !ctxs[j]->device->external_semaphore_fd) {
+            return false;
+        }
+        auto * bctx = (ggml_backend_vk_buffer_context *) tensors[j]->buffer->context;
+        src_bufs[j] = &bctx->dev_buffer;
+        src_offs[j] = vk_tensor_offset(tensors[j]) + tensors[j]->view_offs;
+        if (src_bufs[j]->get()->device.get() != ctxs[j]->device.get()) {
+            return false;
+        }
+    }
+
+    // Allocate or resize per-device scratch buffers used as the alternate buffer
+    // in the direct-P2P add ping-pong. Must happen before peer imports below so
+    // we can also import each peer's scratch.
+    for (size_t j = 0; j < n_backends; j++) {
+        auto & dev = ctxs[j]->device;
+        if (!dev->allreduce_scratch || dev->allreduce_scratch->size < nbytes) {
+            ggml_vk_destroy_buffer(dev->allreduce_scratch);
+            dev->allreduce_scratch = ggml_vk_create_buffer_device(dev, nbytes);
+        }
+    }
+
+    // Pre-import every peer buffer we'll touch: the tensor's source buffer for
+    // the round 0 read, and each peer's allreduce_scratch for round 1+ reads in
+    // the ping-pong scheme. Cached on the source buffer.
+    for (size_t offset = 1; offset < n_backends; offset *= 2) {
+        for (size_t j = 0; j < n_backends; j++) {
+            size_t peer = j ^ offset;
+            vk::Buffer pb_local = ggml_vk_get_or_import_peer_buffer(*src_bufs[peer], ctxs[j]->device.get());
+            if (!pb_local) {
+                return false;
+            }
+            vk::Buffer pb_scratch = ggml_vk_get_or_import_peer_buffer(ctxs[peer]->device->allreduce_scratch, ctxs[j]->device.get());
+            if (!pb_scratch) {
+                return false;
+            }
+        }
+    }
+
+    // Set up cross-device timeline semaphores (one-time, cached on device).
+    if (!ggml_vk_setup_allreduce_semaphores(ctxs, n_backends)) {
+        return false;
+    }
+
+    // Count rounds for descriptor set allocation.
+    size_t n_rounds = 0;
+    for (size_t k = n_backends; k > 1; k >>= 1) { n_rounds++; }
+
+    // Fetch the add_f32 pipeline on each device.
+    std::vector<vk_pipeline> pipelines(n_backends);
+    for (size_t j = 0; j < n_backends; j++) {
+        pipelines[j] = ctxs[j]->device->pipeline_add_norepeat[0][0][0];
+        if (!pipelines[j]) {
+            return false;
+        }
+        ggml_pipeline_request_descriptor_sets(ctxs[j], pipelines[j], n_rounds);
+    }
+    const int64_t ne = ggml_nelements(tensors[0]);
+
+    // Push constants for flat contiguous 1D F32 add.
+    vk_op_binary_push_constants pc {};
+    pc.ne = (uint32_t)ne;
+    pc.ne00 = (uint32_t)tensors[0]->ne[0];
+    pc.ne01 = (uint32_t)tensors[0]->ne[1];
+    pc.ne02 = (uint32_t)tensors[0]->ne[2];
+    pc.ne03 = (uint32_t)tensors[0]->ne[3];
+    pc.nb00 = 1; pc.nb01 = pc.ne00; pc.nb02 = pc.ne00 * pc.ne01; pc.nb03 = pc.ne00 * pc.ne01 * pc.ne02;
+    pc.ne10 = pc.ne00; pc.ne11 = pc.ne01; pc.ne12 = pc.ne02; pc.ne13 = pc.ne03;
+    pc.nb10 = 1; pc.nb11 = pc.ne00; pc.nb12 = pc.ne00 * pc.ne01; pc.nb13 = pc.ne00 * pc.ne01 * pc.ne02;
+    pc.ne20 = pc.ne00; pc.ne21 = pc.ne01; pc.ne22 = pc.ne02; pc.ne23 = pc.ne03;
+    pc.nb20 = 1; pc.nb21 = pc.ne00; pc.nb22 = pc.ne00 * pc.ne01; pc.nb23 = pc.ne00 * pc.ne01 * pc.ne02;
+    pc.misalign_offsets = 0;
+    pc.param1 = 0.0f; pc.param2 = 0.0f; pc.param3 = 0;
+
+    uint32_t elements0;
+    if (ne > 262144)      elements0 = 512;
+    else if (ne > 512)    elements0 = 512;
+    else                  elements0 = (uint32_t)ne;
+    uint32_t elements1 = (ne > 262144) ? 512 : (ne > 512 ? (uint32_t)CEIL_DIV(ne, 512) : 1);
+    uint32_t elements2 = (ne > 262144) ? (uint32_t)CEIL_DIV(ne, 262144) : 1;
+
+    // GPU-synced path: instead of CPU fence-waiting for each backend's
+    // compute to finish, piggyback a "compute-done" timeline semaphore
+    // signal onto the final compute submission, and have allreduce
+    // round 0 wait on peers' compute-done semaphores. Eliminates
+    // ~35ms/token of CPU fence waits for Qwen (84 subgraphs).
+    //
+    // Timeline values per allreduce call (base = current allreduce_tl_value):
+    //   compute-done: base + 1  (signaled by compute submission)
+    //   copy-done R0: base + 2
+    //   add-done  R0: base + 3
+    //   copy-done R1: base + 4
+    //   add-done  R1: base + 5
+    // Total advance: 2*n_rounds + 1
+    static thread_local int allreduce_cleanup_counter = 0;
+    bool need_cleanup = (++allreduce_cleanup_counter >= 16);
+
+    // Step 1: Flush pending compute commands and signal compute-done.
+    // We submit the compute-done signal on a command buffer containing a
+    // full pipeline barrier.  A bare empty or no-op submit is unreliable
+    // on some drivers (Mesa ANV) for cross-device timeline semaphore
+    // propagation, but a command buffer with a real pipeline barrier
+    // forces the driver to process it as a non-trivial submission.
+    for (size_t j = 0; j < n_backends; j++) {
+        auto * ctx = ctxs[j];
+        auto & dev = ctx->device;
+        std::lock_guard<std::recursive_mutex> guard(dev->mutex);
+
+        // Flush transfer context if pending
+        if (ggml_vk_submit_transfer_ctx(ctx)) {
+            ctx->submit_pending = true;
+        }
+
+        // Submit the compute context with compute-done signal attached.
+        uint64_t signal_value = dev->allreduce_tl_value + 1;
+        vk_semaphore compute_done_signal{dev->allreduce_tl_sema, signal_value};
+        bool signaled = false;
+
+        if (!ctx->compute_ctx.expired()) {
+            auto compute_ctx = ctx->compute_ctx.lock();
+            // If the allreduce target's compute was disabled (zero-sized source slice),
+            // zero its buffer before ending the context.  The barrier ensures prior
+            // compute dispatches in the same command buffer finish before the fill.
+            if (!(tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                if (compute_ctx->s == nullptr) {
+                    ggml_vk_ctx_begin(dev, compute_ctx);
+                }
+                vk::MemoryBarrier mb_fill{
+                    vk::AccessFlagBits::eMemoryWrite,
+                    vk::AccessFlagBits::eTransferWrite,
+                };
+                compute_ctx->s->buffer->buf.pipelineBarrier(
+                    vk::PipelineStageFlagBits::eAllCommands,
+                    vk::PipelineStageFlagBits::eTransfer,
+                    {}, { mb_fill }, {}, {});
+                compute_ctx->s->buffer->buf.fillBuffer(
+                    src_bufs[j]->get()->buffer,
+                    (vk::DeviceSize)src_offs[j],
+                    (vk::DeviceSize)nbytes,
+                    0);
+            }
+            ggml_vk_ctx_end(compute_ctx);
+            for (auto& cpy : compute_ctx->in_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
+
+            if (!compute_ctx->seqs.empty()) {
+                // Piggyback onto the last compute submission
+                auto & last_sub = compute_ctx->seqs.back().back();
+                if (dev->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+                    last_sub.wait_semaphores.push_back(ctx->transfer_semaphore);
+                    ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+                }
+                last_sub.signal_semaphores.push_back(compute_done_signal);
+                ggml_vk_submit(compute_ctx, {});
+                signaled = true;
+            } else {
+                ggml_vk_submit(compute_ctx, {}); // no-op (seqs already submitted)
+            }
+        }
+
+        // Edge case: no compute submission to carry the signal (e.g. empty
+        // subgraph).  Emit it from a standalone barrier command buffer.
+        if (!signaled) {
+            vk_context signal_ctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
+            ggml_vk_ctx_begin(dev, signal_ctx);
+            // Barrier first: flush all prior compute/transfer writes from
+            // GPU caches before we overwrite the buffer with fillBuffer.
+            // Without this ordering, the fill (a transfer write) can race
+            // with L2 cache writeback of prior compute results on the same
+            // buffer region, causing the zeros to be clobbered.
+            vk::MemoryBarrier mb{
+                vk::AccessFlagBits::eMemoryWrite,
+                vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eMemoryRead,
+            };
+            signal_ctx->s->buffer->buf.pipelineBarrier(
+                vk::PipelineStageFlagBits::eAllCommands,
+                vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eAllCommands,
+                {}, { mb }, {}, {});
+            // Zero disabled tensors AFTER the barrier so peers see clean zeros.
+            if (!(tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                signal_ctx->s->buffer->buf.fillBuffer(
+                    src_bufs[j]->get()->buffer,
+                    (vk::DeviceSize)src_offs[j],
+                    (vk::DeviceSize)nbytes,
+                    0);
+            }
+            auto & sub = signal_ctx->seqs.back().back();
+            if (dev->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+                sub.wait_semaphores.push_back(ctx->transfer_semaphore);
+                ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+            }
+            sub.signal_semaphores.push_back(compute_done_signal);
+            ggml_vk_ctx_end(signal_ctx);
+            ggml_vk_submit(signal_ctx, {});
+        }
+
+        ctx->submit_pending = false;
+
+        // Release compute context for next subgraph (don't wait for GPU)
+        if (!ctx->compute_ctx.expired()) {
+            ctx->compute_ctx.reset();
+        }
+    }
+
+    // Step 2: Record and submit allreduce commands.
+    //
+    // Each round is a single compute dispatch: dst = src + peer.src, where
+    // src/dst alternate between local and scratch (ping-pong). This replaces
+    // the prior 2-phase (copy peer→scratch, then local+=scratch) with one
+    // P2P-reading add kernel per round, halving command buffers, semaphore
+    // signals, and memory traffic.
+    //
+    // Ping-pong rule:
+    //   round 0: src=local,   dst=scratch   (read peer.local,   write scratch)
+    //   round 1: src=scratch, dst=local     (read peer.scratch, write local)
+    //   round 2: src=local,   dst=scratch   (etc.)
+    //
+    // Race-freedom: in round r, every device reads src-buffers and writes
+    // only dst-buffers. Peer's src buffer is stable (no one writes it this
+    // round). Peer's read of our src finishes before peer signals round-done,
+    // at which point it's safe to begin our next round's write (which may
+    // target that same buffer as dst in round r+1).
+    //
+    // For odd n_rounds the final result lands in scratch, so we append a
+    // scratch→local copy submit after the last round.
+    const bool need_final_copy = (n_rounds % 2 != 0);
+    const size_t n_ar_submits = n_rounds + (need_final_copy ? 1 : 0);
+
+    // Timeline values per round (base = allreduce_tl_value):
+    //   compute-done: base + 1
+    //   round-done r: base + 2 + r
+    //   final-copy-done (if present): base + 2 + n_rounds
+
+    for (size_t j = 0; j < n_backends; j++) {
+        auto & ctx = ctxs[j];
+        auto & dev = ctx->device;
+        std::lock_guard<std::recursive_mutex> guard(dev->mutex);
+
+        std::vector<vk::CommandBuffer>                   cmd_bufs(n_ar_submits);
+        std::vector<vk::SubmitInfo>                      submits(n_ar_submits);
+        std::vector<vk::TimelineSemaphoreSubmitInfo>     tl_infos(n_ar_submits);
+        std::vector<std::vector<vk::Semaphore>>          wait_semas(n_ar_submits);
+        std::vector<std::vector<uint64_t>>               wait_vals(n_ar_submits);
+        std::vector<std::vector<vk::PipelineStageFlags>> wait_stages(n_ar_submits);
+        std::vector<vk::Semaphore>                       signal_semas(n_ar_submits);
+        std::vector<uint64_t>                            signal_vals(n_ar_submits);
+
+        size_t round_idx = 0;
+        for (size_t offset = 1; offset < n_backends; offset *= 2, round_idx++) {
+            const size_t peer = j ^ offset;
+
+            auto & peer_dev = ctxs[peer]->device;
+            vk::Semaphore peer_sema = dev->allreduce_peer_semas[peer_dev->idx];
+
+            // Select src (read) and dst (write) buffers by round parity.
+            // On even rounds read from our/peer local and write scratch; on
+            // odd rounds read from our/peer scratch and write local.
+            const bool read_local = (round_idx % 2 == 0);
+            vk_buffer& local_buf = *src_bufs[j];
+
+            const VkBuffer my_src_buf   = read_local ? (VkBuffer)local_buf->buffer
+                                                     : (VkBuffer)dev->allreduce_scratch->buffer;
+            const vk::DeviceSize my_src_off = read_local ? (vk::DeviceSize)src_offs[j] : (vk::DeviceSize)0;
+
+            const VkBuffer my_dst_buf   = read_local ? (VkBuffer)dev->allreduce_scratch->buffer
+                                                     : (VkBuffer)local_buf->buffer;
+            const vk::DeviceSize my_dst_off = read_local ? (vk::DeviceSize)0 : (vk::DeviceSize)src_offs[j];
+
+            vk_buffer& peer_src_src_buf = read_local ? *src_bufs[peer] : ctxs[peer]->device->allreduce_scratch;
+            vk::Buffer peer_src_vk_buf  = ggml_vk_get_or_import_peer_buffer(peer_src_src_buf, dev.get());
+            const vk::DeviceSize peer_src_off = read_local ? (vk::DeviceSize)src_offs[peer] : (vk::DeviceSize)0;
+
+            // --- ADD command buffer: dst = src + peer.src ---
+            {
+                vk_context subctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
+                ggml_vk_ctx_begin(dev, subctx);
+                vk::DescriptorBufferInfo src0_dbi{ my_src_buf,       my_src_off,   (vk::DeviceSize)nbytes };
+                vk::DescriptorBufferInfo src1_dbi{ peer_src_vk_buf,  peer_src_off, (vk::DeviceSize)nbytes };
+                vk::DescriptorBufferInfo dst_dbi { my_dst_buf,       my_dst_off,   (vk::DeviceSize)nbytes };
+                ggml_vk_dispatch_pipeline(ctx, subctx, pipelines[j],
+                    { src0_dbi, src1_dbi, dst_dbi, src0_dbi }, pc, { elements0, elements1, elements2 });
+                ggml_vk_ctx_end(subctx);
+                GGML_ASSERT(!subctx->seqs.empty() && !subctx->seqs[0].empty());
+                cmd_bufs[round_idx] = subctx->seqs[0][0].buffer->buf;
+            }
+
+            // Peer wait (RAW): round 0 waits on peer's compute-done, later
+            // rounds wait on peer's previous round-done, so peer's writes
+            // to the src buffer we're about to read are visible.
+            //
+            // Self-wait: same-queue cross-submit-batch memory visibility is
+            // NOT implicit, so we must also wait on our OWN tl_sema at the
+            // prior stage's signal. For round 0 the prior stage is compute-
+            // done (our shader reads our local which compute just wrote);
+            // for round r>0 it is round r-1's signal (our shader reads our
+            // scratch/local which round r-1 just wrote).
+            //
+            // Prior-round peer wait (WAR): the buffer we're about to write
+            // (X[r+1]) is the same buffer that the PRIOR round's peer
+            // (j ^ 2^(r-1)) read from us in round r-1 (since X[r-1] and
+            // X[r+1] share parity). Without waiting on that peer's round-
+            // (r-1) signal, our write can race their still-in-flight read
+            // across PCIe, corrupting their partial sum. The round-r peer
+            // (j ^ 2^r) is a different device and its signal does not
+            // imply the prior-round peer finished.
+            wait_semas[round_idx].push_back(peer_sema);
+            wait_vals[round_idx].push_back(round_idx == 0
+                ? peer_dev->allreduce_tl_value + 1
+                : peer_dev->allreduce_tl_value + 2 + (round_idx - 1));
+            wait_stages[round_idx].push_back(vk::PipelineStageFlagBits::eAllCommands);
+
+            wait_semas[round_idx].push_back(dev->allreduce_tl_sema);
+            wait_vals[round_idx].push_back(round_idx == 0
+                ? dev->allreduce_tl_value + 1
+                : dev->allreduce_tl_value + 2 + (round_idx - 1));
+            wait_stages[round_idx].push_back(vk::PipelineStageFlagBits::eAllCommands);
+
+            if (round_idx > 0) {
+                const size_t prev_peer = j ^ (offset / 2);
+                auto & prev_peer_dev = ctxs[prev_peer]->device;
+                vk::Semaphore prev_peer_sema = dev->allreduce_peer_semas[prev_peer_dev->idx];
+                wait_semas[round_idx].push_back(prev_peer_sema);
+                wait_vals[round_idx].push_back(prev_peer_dev->allreduce_tl_value + 2 + (round_idx - 1));
+                wait_stages[round_idx].push_back(vk::PipelineStageFlagBits::eAllCommands);
+            }
+
+            signal_semas[round_idx] = dev->allreduce_tl_sema;
+            signal_vals[round_idx]  = dev->allreduce_tl_value + 2 + round_idx;
+        }
+
+        // Optional final copy for odd n_rounds: scratch -> local.
+        if (need_final_copy) {
+            vk_context subctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
+            ggml_vk_ctx_begin(dev, subctx);
+            vk::BufferCopy region{ 0, (vk::DeviceSize)src_offs[j], (vk::DeviceSize)nbytes };
+            subctx->s->buffer->buf.copyBuffer(
+                dev->allreduce_scratch->buffer, src_bufs[j]->get()->buffer, { region });
+            ggml_vk_ctx_end(subctx);
+            GGML_ASSERT(!subctx->seqs.empty() && !subctx->seqs[0].empty());
+            const size_t si = n_rounds;
+            cmd_bufs[si] = subctx->seqs[0][0].buffer->buf;
+            // Self-wait on last round's signal so the copy reads a stable scratch.
+            wait_semas[si].push_back(dev->allreduce_tl_sema);
+            wait_vals[si].push_back(dev->allreduce_tl_value + 2 + (n_rounds - 1));
+            wait_stages[si].push_back(vk::PipelineStageFlagBits::eAllCommands);
+            // WAR: the final copy writes our local, which was last read
+            // across PCIe by the round-(n_rounds-1) peer (an even-parity
+            // round since n_rounds is odd here, so its src was local).
+            // Without this wait, the copy can clobber that peer's still-
+            // in-flight read. The round-(n_rounds-1) peer is
+            // j ^ 2^(n_rounds-1) = j ^ (n_backends/2).
+            {
+                const size_t last_peer = j ^ (n_backends >> 1);
+                auto & last_peer_dev = ctxs[last_peer]->device;
+                vk::Semaphore last_peer_sema = dev->allreduce_peer_semas[last_peer_dev->idx];
+                wait_semas[si].push_back(last_peer_sema);
+                wait_vals[si].push_back(last_peer_dev->allreduce_tl_value + 2 + (n_rounds - 1));
+                wait_stages[si].push_back(vk::PipelineStageFlagBits::eAllCommands);
+            }
+            signal_semas[si] = dev->allreduce_tl_sema;
+            signal_vals[si]  = dev->allreduce_tl_value + 2 + n_rounds;
+        }
+
+        for (size_t si = 0; si < n_ar_submits; si++) {
+            tl_infos[si] = vk::TimelineSemaphoreSubmitInfo{
+                (uint32_t)wait_vals[si].size(), wait_vals[si].data(),
+                1, &signal_vals[si],
+            };
+            submits[si] = vk::SubmitInfo{
+                (uint32_t)wait_semas[si].size(), wait_semas[si].data(),
+                wait_stages[si].data(),
+                1, &cmd_bufs[si],
+                1, &signal_semas[si],
+            };
+            submits[si].pNext = &tl_infos[si];
+        }
+
+        {
+            std::lock_guard<std::mutex> guard2(queue_mutex);
+            dev->compute_queue.queue.submit(submits, vk::Fence{});
+        }
+    }
+
+    // Update timeline values: +1 for compute-done, +n_rounds for each round,
+    // and +1 for the optional final copy.
+    const uint64_t tl_advance = 1 + n_rounds + (need_final_copy ? 1 : 0);
+    for (size_t j = 0; j < n_backends; j++) {
+        ctxs[j]->device->allreduce_tl_value += tl_advance;
+    }
+
+    // Periodically wait for GPU and clean up command pools.
+    if (need_cleanup) {
+        allreduce_cleanup_counter = 0;
+        // Wait on the timeline semaphore (most recent value) for each device
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & dev = ctxs[j]->device;
+            std::lock_guard<std::recursive_mutex> guard(dev->mutex);
+            uint64_t wait_value = dev->allreduce_tl_value;
+            vk::SemaphoreWaitInfo swi{};
+            swi.semaphoreCount = 1;
+            swi.pSemaphores = &dev->allreduce_tl_sema;
+            swi.pValues = &wait_value;
+            VK_CHECK(dev->device.waitSemaphores(swi, UINT64_MAX), "allreduce cleanup wait");
+            ggml_vk_queue_command_pools_cleanup(dev);
+        }
+    }
+
+    return true;
+}
+#endif // _WIN32
+
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
@@ -16127,11 +16853,49 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// Comm context for the meta backend's comm_init/comm_allreduce/comm_free API.
+// Wraps the existing ggml_backend_vk_allreduce_tensor function.
+struct ggml_backend_vk_comm_context {
+    std::vector<ggml_backend_t> backends;
+};
+
+static void * ggml_backend_vk_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    auto * ctx = new ggml_backend_vk_comm_context;
+    ctx->backends.assign(backends, backends + n_backends);
+    return ctx;
+}
+
+static void ggml_backend_vk_comm_free(void * comm_ctx) {
+    delete (ggml_backend_vk_comm_context *) comm_ctx;
+}
+
+static bool ggml_backend_vk_comm_allreduce_tensor(void * comm_ctx, struct ggml_tensor ** tensors) {
+    auto * ctx = (ggml_backend_vk_comm_context *) comm_ctx;
+    return ggml_backend_vk_allreduce_tensor(ctx->backends.data(), tensors, ctx->backends.size());
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+#ifndef _WIN32
+    if (strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *) ggml_backend_vk_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *) ggml_backend_vk_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *) ggml_backend_vk_comm_allreduce_tensor;
+    }
+#endif
+    GGML_UNUSED(name);
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
