@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -307,12 +308,56 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
     return max_size;
 }
 
+// Forward declarations used by get_alloc_size and alloc_buffer.
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_no_alloc(
+    const struct ggml_tensor * tensor,
+    size_t n_bufs,
+    bool assume_sync,
+    std::unordered_map<const ggml_tensor *, ggml_backend_meta_split_state> & cache);
+
+// Thread-local cache used by ggml_backend_meta_get_split_state_no_alloc.
+// gallocr_reserve_n calls get_alloc_size repeatedly across the graph;
+// memoizing makes the cost O(graph_size) instead of O(graph_size * depth).
+// Cleared in alloc_buffer because ggml_tensor pointers can be recycled
+// across gallocr reserve passes.
+static thread_local std::unordered_map<const ggml_tensor *, ggml_backend_meta_split_state> meta_split_state_no_alloc_cache;
+
 static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
     size_t max_alloc_size = 0;
     for (size_t i = 0; i < n_simple_bufts; i++) {
         const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);
         max_alloc_size = std::max(max_alloc_size, alloc_size);
+    }
+
+    // For tensor-parallel execution, each device only holds a slice of any
+    // split tensor.  Reserve the per-device size instead of the full size to
+    // avoid over-allocating compute scratch by ~N×.  The per-device size is
+    // derived from the same per-op switch that runs at compute time
+    // (meta_dispatch_split_state via the _no_alloc walker), so reserve-time
+    // and compute-time agree on layout — no silent OOB writes.
+    //
+    // Mirrored, partial, and unknown axes keep the full size (the simple
+    // backend writes the full tensor on every device).
+    if (n_simple_bufts > 1 && max_alloc_size > 0) {
+        const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state_no_alloc(
+            tensor, n_simple_bufts, /*assume_sync=*/true, meta_split_state_no_alloc_cache);
+        if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+            int64_t max_per_dev = 0;
+            for (size_t j = 0; j < n_simple_bufts; j++) {
+                int64_t dev_sum = 0;
+                for (size_t s = 0; s < ss.n_segments; s++) {
+                    dev_sum += ss.ne[s*n_simple_bufts + j];
+                }
+                max_per_dev = std::max(max_per_dev, dev_sum);
+            }
+            const int64_t full = tensor->ne[ss.axis];
+            if (max_per_dev > 0 && full > 0 && max_per_dev < full) {
+                // Ceiling multiply to avoid truncating when max_alloc_size *
+                // max_per_dev isn't exactly divisible by full.
+                max_alloc_size = (max_alloc_size * max_per_dev + full - 1) / full;
+            }
+        }
     }
     return max_alloc_size;
 }
@@ -463,9 +508,18 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return result;
 }
 
-static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+// Per-op dispatch: given a tensor's op and its sources' split states, compute
+// the tensor's split state.  Does not depend on tensor->buffer — both the
+// allocated-tensor path (ggml_backend_meta_get_split_state) and the
+// unallocated-tensor walker (ggml_backend_meta_get_split_state_no_alloc) call
+// this with src_ss already built, so there is a single per-op switch in the
+// codebase that is the source of truth for "what is this tensor's per-device
+// split layout".
+static ggml_backend_meta_split_state meta_dispatch_split_state(
+        const ggml_tensor * tensor,
+        const std::vector<ggml_backend_meta_split_state> & src_ss,
+        size_t n_bufs,
+        bool assume_sync) {
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
@@ -773,37 +827,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1};
     };
 
-    auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
-        if (ggml_nelements(tensor) == 0) {
-            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
-        }
-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
-            const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
-            ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
-            if (ret.axis >= 0 && ret.axis <= GGML_MAX_DIMS) {
-                const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
-                int64_t ne_sum = 0;
-                for (size_t sj = 0; sj < ret.n_segments*n_bufs; sj++) {
-                    GGML_ASSERT(ret.ne[sj] % granularity == 0);
-                    ne_sum += ret.ne[sj];
-                }
-                GGML_ASSERT(ne_sum == tensor->ne[ret.axis]);
-            }
-            return ret;
-        }
-
-        std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, 1});
-        for (size_t i = 0; i < GGML_MAX_SRC; i++) {
-            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
-                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
-                continue;
-            }
-            src_ss[i] = ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true);
-            GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
-        }
-
-        ggml_backend_meta_split_state split_state;
+    ggml_backend_meta_split_state split_state;
         switch (tensor->op) {
             case GGML_OP_NONE: {
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
@@ -998,7 +1022,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         }
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
-            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
@@ -1034,7 +1057,49 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             }
             GGML_ASSERT(!first_src_split_by_axis);
         }
-        return split_state;
+    return split_state;
+}
+
+// Get the per-device split state of a tensor that has been allocated to a meta
+// buffer (a weight, KV cache, or compute tensor whose buffer is already set).
+// Results are memoized in the buffer context; subsequent calls hit the cache.
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+
+    auto compute_split_state = [&]() -> ggml_backend_meta_split_state {
+        if (ggml_nelements(tensor) == 0) {
+            return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+        }
+        // Leaf with statically-known split state (allocated weight or KV cache):
+        // ask the device for its layout.
+        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+            const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+            ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
+            if (ret.axis >= 0 && ret.axis <= GGML_MAX_DIMS) {
+                const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
+                int64_t ne_sum = 0;
+                for (size_t sj = 0; sj < ret.n_segments*n_bufs; sj++) {
+                    GGML_ASSERT(ret.ne[sj] % granularity == 0);
+                    ne_sum += ret.ne[sj];
+                }
+                GGML_ASSERT(ne_sum == tensor->ne[ret.axis]);
+            }
+            return ret;
+        }
+        // Compute / view tensor: recursively get the sources' split states, then
+        // dispatch through the per-op switch.
+        std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, 1});
+        for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+                continue;
+            }
+            src_ss[i] = ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true);
+            GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        }
+        return meta_dispatch_split_state(tensor, src_ss, n_bufs, assume_sync);
     };
 
     const std::pair key = std::make_pair(tensor, assume_sync);
@@ -1045,7 +1110,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
-        buf_ctx->split_state_cache[key].first = calculate_split_state();
+        buf_ctx->split_state_cache[key].first = compute_split_state();
         memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
@@ -1091,6 +1156,54 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     }
 #endif // NDEBUG
     return ret;
+}
+
+// Like ggml_backend_meta_get_split_state, but works on tensors that may not
+// yet be allocated to a meta buffer (e.g. compute tensors during gallocr's
+// reserve pass).  For allocated tensors, delegates to the buffer-cached
+// function.  For unallocated tensors, recursively computes split states
+// through src tensors using the same per-op dispatch as the allocated path,
+// so the result is consistent with what compute_split_state will produce at
+// compute time.
+//
+// The `cache` map must be cleared whenever the underlying tensor graph is
+// rebuilt — ggml_tensor pointers can be recycled across gallocr reserve
+// passes.  See ggml_backend_meta_buffer_type_alloc_buffer.
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_no_alloc(
+        const struct ggml_tensor * tensor,
+        size_t n_bufs,
+        bool assume_sync,
+        std::unordered_map<const ggml_tensor *, ggml_backend_meta_split_state> & cache) {
+    if (tensor == nullptr || ggml_nelements(tensor) == 0) {
+        return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+    }
+
+    // Already-allocated tensor (leaf or a compute tensor whose meta buffer
+    // exists): delegate so the device-context callback and the buffer cache
+    // stay the single source of truth.
+    if (tensor->buffer != nullptr && ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return ggml_backend_meta_get_split_state(tensor, assume_sync);
+    }
+
+    auto it = cache.find(tensor);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    // Sentinel before recursing — guards self-referencing tensors.
+    cache[tensor] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+
+    std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, 1});
+    for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+        if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+            src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
+            continue;
+        }
+        src_ss[i] = ggml_backend_meta_get_split_state_no_alloc(tensor->src[i], n_bufs, assume_sync, cache);
+    }
+
+    ggml_backend_meta_split_state result = meta_dispatch_split_state(tensor, src_ss, n_bufs, assume_sync);
+    cache[tensor] = result;
+    return result;
 }
 
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -1447,6 +1560,12 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+
+    // Clear the per-thread split-state cache used by get_alloc_size during
+    // gallocr reserve passes: ggml_tensor pointers from previous graphs may
+    // be recycled (the same address can refer to a different tensor in a
+    // later graph build).
+    meta_split_state_no_alloc_cache.clear();
 
     ggml_init_params params = {
         /*.mem_size   =*/ 1024*1024*1024, // FIXME
