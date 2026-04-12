@@ -15,6 +15,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -307,6 +308,151 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
     return max_size;
 }
 
+static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
+static size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf);
+
+// Per-device allocation scaling for tensor-parallel compute scratch.
+//
+// The gallocr's reserve pass calls get_alloc_size once per compute tensor.
+// If a compute tensor's per-device data is smaller than the full tensor
+// (because the tensor is "split" — each device holds only a slice along
+// some axis), we can reserve less than the full size on each device.  The
+// reduction factor must match what the simple backend will actually write:
+// under-reporting causes silent memory corruption when the next tensor is
+// laid out at an offset that overlaps with the split tensor's real data.
+//
+// This is complicated by three things:
+//
+// 1. `calculate_split_state` runs once per compute tensor at graph init
+//    (much later), using the meta buffer context for caching.  At reserve
+//    time the compute meta buffer doesn't exist yet, so we can't call it.
+//
+// 2. Non-uniform splits: n_kv_heads=2 across 4 devices at granularity 128
+//    gives per-device counts [0, 128, 0, 128].  The max per-device size is
+//    full/2, not full/N=full/4.  The commit's naive `full/N` formula under-
+//    allocates in that case.
+//
+// 3. Mul_mat reductions: row-parallel mul_mat (both operands split on the
+//    contraction axis) produces a MIRRORED result.  Each device computes a
+//    full-sized partial sum which is then combined by an implicit AllReduce.
+//    The result needs full size on every device, not full/N.  A naive "any
+//    split ancestor → split" DAG walk over-classifies these as split and
+//    under-allocates.
+//
+// Approach: walk the tensor's source DAG once, aggregating the largest
+// per-device ne ratio from any statically-split ancestor (weight or cache)
+// that the tensor actually inherits from.  MUL_MAT/MUL_MAT_ID with BOTH
+// operands split is treated as a reduction and reports no ratio (full
+// size).  Every other op inherits from whichever of its sources reports
+// a ratio — for split-preserving ops (reshape, permute, norm, add, mul,
+// rope, …) this matches `calculate_split_state`'s post-processing, which
+// scales per-device ne proportionally and therefore preserves the ratio.
+//
+// CRITICAL: the ratio must be monotone non-increasing from any source to
+// its descendants.  Otherwise gallocr's in-place reuse check
+// (parent_size >= node_size) fires when a larger-ratio node tries to
+// reuse a smaller-ratio parent's slot.  In practice that means: if a
+// node's sources have different ratios, we take the SMALLEST ratio (which
+// gives the LARGEST allocation), so the node never shrinks below any
+// source.  Sources with no ratio (mirrored leaves and post-reduction
+// mul_mat outputs) don't contribute — only actually-split sources do.
+static thread_local std::unordered_map<const ggml_tensor *, std::pair<int64_t, int64_t>> tensor_split_ratio_cache;
+
+// Fills out_max/out_full with the split ratio to apply to `tensor`:
+// per-device size is full_size * out_max / out_full.  Returns true iff a
+// proper ratio (< 1) is known; false means "allocate the full size".
+static bool ggml_backend_meta_tensor_split_ratio(const ggml_tensor * tensor, int64_t & out_max, int64_t & out_full) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    auto it = tensor_split_ratio_cache.find(tensor);
+    if (it != tensor_split_ratio_cache.end()) {
+        out_max  = it->second.first;
+        out_full = it->second.second;
+        return out_full > 0;
+    }
+    // Sentinel to prevent infinite recursion on self-referencing tensors.
+    tensor_split_ratio_cache[tensor] = {0, 0};
+
+    int64_t max_per_dev = 0;
+    int64_t full        = 0;
+    bool    found       = false;
+
+    auto merge_source = [&](const ggml_tensor * src) {
+        if (src == nullptr || src == tensor) {
+            return;
+        }
+        int64_t m = 0, f = 0;
+        if (!ggml_backend_meta_tensor_split_ratio(src, m, f) || f <= 0 || m <= 0) {
+            return;
+        }
+        // Take the SMALLEST per-device ratio m/f so that the result is
+        // monotone non-increasing from any source — ensuring in-place
+        // reuse (which requires parent_size >= node_size) is always valid.
+        if (!found || m * full < max_per_dev * f) {
+            max_per_dev = m;
+            full        = f;
+        }
+        found = true;
+    };
+
+    if (tensor->buffer && ggml_backend_buffer_is_meta(tensor->buffer)) {
+        // Leaf (weight or KV cache) with a statically-known split state.
+        const ggml_backend_meta_split_state ss =
+            ggml_backend_meta_get_split_state(tensor, /*assume_sync=*/true);
+        if (ss.axis >= 0 && ss.axis < GGML_MAX_DIMS) {
+            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            for (size_t j = 0; j < n_bufs; j++) {
+                int64_t dev_sum = 0;
+                for (size_t s = 0; s < ss.n_segments; s++) {
+                    dev_sum += ss.ne[s*n_bufs + j];
+                }
+                max_per_dev = std::max(max_per_dev, dev_sum);
+                full       += dev_sum;
+            }
+            found = (full > 0 && max_per_dev > 0);
+        }
+    } else if (tensor->view_src != nullptr && tensor->view_src != tensor) {
+        // Views / reshapes / permutes / transposes preserve the ratio.
+        found = ggml_backend_meta_tensor_split_ratio(tensor->view_src, max_per_dev, full);
+    } else if (tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_MUL_MAT_ID) {
+        // Row-parallel reduction: if BOTH operands are split, the result
+        // is a full-size partial sum that gets AllReduced — do NOT report
+        // a ratio.  Column-parallel (only one operand split) inherits
+        // from the split operand.
+        int64_t m0 = 0, f0 = 0, m1 = 0, f1 = 0;
+        const bool s0 = tensor->src[0] != nullptr && tensor->src[0] != tensor &&
+                        ggml_backend_meta_tensor_split_ratio(tensor->src[0], m0, f0);
+        const bool s1 = tensor->src[1] != nullptr && tensor->src[1] != tensor &&
+                        ggml_backend_meta_tensor_split_ratio(tensor->src[1], m1, f1);
+        if (s0 && s1) {
+            found = false; // reduction → full size required
+        } else if (s0) {
+            max_per_dev = m0;
+            full        = f0;
+            found       = true;
+        } else if (s1) {
+            max_per_dev = m1;
+            full        = f1;
+            found       = true;
+        }
+    } else {
+        // Any other op: take the smallest per-device ratio among sources.
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            merge_source(tensor->src[i]);
+        }
+    }
+
+    if (!found) {
+        max_per_dev = 0;
+        full        = 0;
+    }
+    tensor_split_ratio_cache[tensor] = {max_per_dev, full};
+    out_max  = max_per_dev;
+    out_full = full;
+    return found;
+}
+
 static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
     size_t max_alloc_size = 0;
@@ -314,6 +460,22 @@ static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_t
         const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);
         max_alloc_size = std::max(max_alloc_size, alloc_size);
     }
+
+    // Reduce the allocation for tensors that are split across devices.
+    // See the comment on ggml_backend_meta_tensor_split_ratio for why the
+    // ratio is computed this way (and why naive `full/N` is wrong for
+    // non-uniform splits and for row-parallel mul_mat outputs).
+    if (n_simple_bufts > 1 && max_alloc_size > 0) {
+        int64_t max_per_dev = 0;
+        int64_t full        = 0;
+        if (ggml_backend_meta_tensor_split_ratio(tensor, max_per_dev, full) &&
+                full > 0 && max_per_dev > 0 && max_per_dev < full) {
+            // Ceiling multiply to avoid truncating when max_alloc_size * max_per_dev
+            // isn't exactly divisible by full.
+            max_alloc_size = (max_alloc_size * max_per_dev + full - 1) / full;
+        }
+    }
+
     return max_alloc_size;
 }
 
@@ -1445,6 +1607,9 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+
+    // Clear the split ratio cache — tensor pointers from previous graphs may be recycled.
+    tensor_split_ratio_cache.clear();
 
     ggml_init_params params = {
         /*.mem_size   =*/ 1024*1024*1024, // FIXME
