@@ -62,6 +62,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <future>
 #include <thread>
@@ -235,6 +236,10 @@ struct vk_command_pool {
     std::deque<vk_command_buffer> cmd_buffers;
 
     vk_queue *q;
+
+    // If true, command buffers allocated from this pool are reusable (not
+    // one-time-submit) so that a recorded graph can be re-submitted.
+    bool cached_graph_pool = false;
 
     size_t buffers_in_use() const {
         return std::count_if(cmd_buffers.begin(), cmd_buffers.end(),
@@ -2058,6 +2063,46 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// A cached entry for a recorded compute graph. The command buffers, descriptor
+// sets, and descriptor pools are all owned by the entry and kept alive across
+// calls so that the recorded work can be re-submitted without rebuilding the
+// command buffers. Entries are keyed by ggml_cgraph::uid.
+struct vk_graph_cache_entry {
+    uint64_t uid = 0;
+    int64_t  last_used_time = 0;
+
+    vk_command_pool cmd_pool {};
+    std::vector<vk::DescriptorPool> descriptor_pools;
+    std::vector<vk::DescriptorSet>  descriptor_sets;
+
+    // Number of command buffers recorded during the last build. These are
+    // submitted in allocation order (which matches submission order) on a
+    // cache hit.
+    size_t num_cmd_buffers = 0;
+
+    // Flat list of VkCommandBuffer handles in submission order, populated at
+    // build finalization. The cache-hit replay path passes this directly to
+    // vkQueueSubmit with no per-hit allocations - avoiding the vk_context /
+    // vk_submission machinery the build path uses.
+    std::vector<vk::CommandBuffer> replay_cbs;
+
+    // Snapshot of ctx->prealloc_buf_generation at build time. The recorded
+    // descriptor sets bind specific VkBuffer handles for prealloc_x/y/...
+    // If those buffers get reallocated (the generation advances), the cached
+    // descriptors point at freed handles and must not be re-submitted.
+    uint64_t prealloc_buf_generation = 0;
+
+    void destroy(vk_device & device) {
+        for (auto & pool : descriptor_pools) {
+            device->device.destroyDescriptorPool(pool);
+        }
+        descriptor_pools.clear();
+        descriptor_sets.clear();
+        replay_cbs.clear();
+        cmd_pool.destroy(device->device);
+    }
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2124,6 +2169,26 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // Graph caching. Keyed by ggml_cgraph::uid, stores pre-recorded command
+    // buffers and descriptor sets that can be re-submitted without rebuilding
+    // when the same graph is executed again. The active_graph_cache_entry is
+    // non-null only while a cacheable graph is being built, which redirects
+    // command buffer and descriptor set allocation to the entry's pools.
+    std::unordered_map<uint64_t, std::unique_ptr<vk_graph_cache_entry>> graph_cache;
+    vk_graph_cache_entry * active_graph_cache_entry = nullptr;
+    int64_t last_graph_cache_eviction_sweep = 0;
+
+    // Uids we've built before. We only create a cache entry on the second
+    // sighting: first-time builds go through the normal (uncached) path so we
+    // don't pay the VkCommandPool / VkDescriptorPool creation cost for
+    // one-shot graphs (e.g. llama-bench cycles through many distinct uids).
+    std::unordered_set<uint64_t> graph_cache_seen_uids;
+
+    // Bumped whenever any prealloc_{x,y,split_k,add_rms_partials} buffer is
+    // reallocated. Cache entries snapshot this and are invalidated on mismatch
+    // (their cached descriptor sets reference the now-freed VkBuffer handles).
+    uint64_t prealloc_buf_generation = 0;
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -2689,8 +2754,17 @@ static void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, 
 }
 
 static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx) {
+    // Route allocations to the cache entry's descriptor pools/sets while a
+    // cacheable graph is being built, so the descriptor bindings survive
+    // across calls and aren't overwritten by subsequent graph_compute calls.
+    std::vector<vk::DescriptorPool> & descriptor_pools = ctx->active_graph_cache_entry
+        ? ctx->active_graph_cache_entry->descriptor_pools
+        : ctx->descriptor_pools;
+    std::vector<vk::DescriptorSet> & descriptor_sets = ctx->active_graph_cache_entry
+        ? ctx->active_graph_cache_entry->descriptor_sets
+        : ctx->descriptor_sets;
 
-    if (ctx->descriptor_sets.size() >= ctx->pipeline_descriptor_set_requirements) {
+    if (descriptor_sets.size() >= ctx->pipeline_descriptor_set_requirements) {
         // Enough descriptors are available
         return;
     }
@@ -2698,29 +2772,29 @@ static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx
     vk_device& device = ctx->device;
 
     // Grow by 50% to avoid frequent allocations
-    uint32_t needed = std::max(3 * ctx->descriptor_sets.size() / 2, size_t{ctx->pipeline_descriptor_set_requirements});
-    uint32_t to_alloc = needed - ctx->descriptor_sets.size();
-    uint32_t pool_remaining = VK_DEVICE_DESCRIPTOR_POOL_SIZE - ctx->descriptor_sets.size() % VK_DEVICE_DESCRIPTOR_POOL_SIZE;
-    uint32_t pool_idx = ctx->descriptor_sets.size() / VK_DEVICE_DESCRIPTOR_POOL_SIZE;
+    uint32_t needed = std::max(3 * descriptor_sets.size() / 2, size_t{ctx->pipeline_descriptor_set_requirements});
+    uint32_t to_alloc = needed - descriptor_sets.size();
+    uint32_t pool_remaining = VK_DEVICE_DESCRIPTOR_POOL_SIZE - descriptor_sets.size() % VK_DEVICE_DESCRIPTOR_POOL_SIZE;
+    uint32_t pool_idx = descriptor_sets.size() / VK_DEVICE_DESCRIPTOR_POOL_SIZE;
 
     while (to_alloc > 0) {
         const uint32_t alloc_count = std::min(pool_remaining, to_alloc);
         to_alloc -= alloc_count;
         pool_remaining = VK_DEVICE_DESCRIPTOR_POOL_SIZE;
 
-        if (pool_idx >= ctx->descriptor_pools.size()) {
+        if (pool_idx >= descriptor_pools.size()) {
             vk::DescriptorPoolSize descriptor_pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT * VK_DEVICE_DESCRIPTOR_POOL_SIZE);
             vk::DescriptorPoolCreateInfo descriptor_pool_create_info({}, VK_DEVICE_DESCRIPTOR_POOL_SIZE, descriptor_pool_size);
-            ctx->descriptor_pools.push_back(device->device.createDescriptorPool(descriptor_pool_create_info));
+            descriptor_pools.push_back(device->device.createDescriptorPool(descriptor_pool_create_info));
         }
 
         std::vector<vk::DescriptorSetLayout> layouts(alloc_count);
         for (uint32_t i = 0; i < alloc_count; i++) {
             layouts[i] = device->dsl;
         }
-        vk::DescriptorSetAllocateInfo descriptor_set_alloc_info(ctx->descriptor_pools[pool_idx], alloc_count, layouts.data());
+        vk::DescriptorSetAllocateInfo descriptor_set_alloc_info(descriptor_pools[pool_idx], alloc_count, layouts.data());
         std::vector<vk::DescriptorSet> sets = device->device.allocateDescriptorSets(descriptor_set_alloc_info);
-        ctx->descriptor_sets.insert(ctx->descriptor_sets.end(), sets.begin(), sets.end());
+        descriptor_sets.insert(descriptor_sets.end(), sets.begin(), sets.end());
 
         pool_idx++;
     }
@@ -7206,7 +7280,15 @@ static vk_command_buffer* ggml_vk_get_or_create_cmd_buffer(vk_device& device, vk
 static vk_submission ggml_vk_begin_submission(vk_device& device, vk_command_pool& p, bool one_time = true) {
     vk_submission s;
     s.buffer = ggml_vk_get_or_create_cmd_buffer(device, p);
-    if (one_time) {
+    // Command buffers from a cached-graph pool must be reusable so that the
+    // recorded graph can be re-submitted on cache hits. eSimultaneousUse is
+    // also required: on async backends the previous submission of a cached
+    // cmd buffer may still be pending when the same cgraph->uid comes back
+    // (graph_compute returns without waiting), so submitting again without
+    // eSimultaneousUse would violate the Vulkan spec.
+    if (p.cached_graph_pool) {
+        s.buffer->buf.begin({ vk::CommandBufferUsageFlagBits::eSimultaneousUse });
+    } else if (one_time) {
         s.buffer->buf.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
     } else {
         s.buffer->buf.begin({ vk::CommandBufferUsageFlags{} });
@@ -7253,12 +7335,17 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                 wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
-    GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
+    // While building a cacheable graph, use the cache entry's descriptor sets
+    // so the bindings persist across calls.
+    std::vector<vk::DescriptorSet> & descriptor_sets = ctx->active_graph_cache_entry
+        ? ctx->active_graph_cache_entry->descriptor_sets
+        : ctx->descriptor_sets;
+    GGML_ASSERT(ctx->descriptor_set_idx < descriptor_sets.size());
     GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
-    vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
+    vk::DescriptorSet& descriptor_set = descriptor_sets[ctx->descriptor_set_idx++];
     vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
     ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
 
@@ -7304,7 +7391,12 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
     if (!ctx->compute_ctx.expired()) {
         result = ctx->compute_ctx.lock();
     } else {
-        result = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+        // If we're building a cacheable graph, record into the cache entry's
+        // command pool so the command buffers survive across calls.
+        vk_command_pool & pool = ctx->active_graph_cache_entry
+            ? ctx->active_graph_cache_entry->cmd_pool
+            : ctx->compute_cmd_pool;
+        result = ggml_vk_create_context(ctx, pool);
 
         ctx->compute_ctx = result;
         ggml_vk_ctx_begin(ctx->device, result);
@@ -13003,6 +13095,7 @@ static void ggml_vk_test_matmul(ggml_backend_vk_context * ctx, size_t m, size_t 
                 ggml_vk_destroy_buffer(ctx->prealloc_split_k);
             }
             ctx->prealloc_split_k = ggml_vk_create_buffer_check(ctx->device, sizeof(float) * d_ne * split_k, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+            ctx->prealloc_buf_generation++;
         }
     }
 
@@ -13511,6 +13604,7 @@ static void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m,
                 ggml_vk_destroy_buffer(ctx->prealloc_split_k);
             }
             ctx->prealloc_split_k = ggml_vk_create_buffer_check(ctx->device, sizeof(float) * d_ne * split_k, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+            ctx->prealloc_buf_generation++;
         }
     }
     if (mmq) {
@@ -13763,6 +13857,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
             ggml_vk_destroy_buffer(ctx->prealloc_x);
         }
         ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x);
+        ctx->prealloc_buf_generation++;
     }
     if (ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
@@ -13772,6 +13867,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         }
         ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_y);
         ctx->prealloc_y_last_tensor_used = nullptr;
+        ctx->prealloc_buf_generation++;
     }
     if (ctx->prealloc_split_k == nullptr || (ctx->prealloc_size_split_k > 0 && ctx->prealloc_split_k->size < ctx->prealloc_size_split_k)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(split_k_size: " << ctx->prealloc_size_split_k << ")");
@@ -13780,6 +13876,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
             ggml_vk_destroy_buffer(ctx->prealloc_split_k);
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
+        ctx->prealloc_buf_generation++;
     }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
@@ -13788,6 +13885,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
             ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
         }
         ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
+        ctx->prealloc_buf_generation++;
     }
 }
 
@@ -14419,6 +14517,15 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     }
     ctx->descriptor_pools.clear();
     ctx->descriptor_sets.clear();
+
+    // Tear down any cached graph entries (their cmd pools and descriptor
+    // pools survived graph_cleanup calls because they aren't part of the
+    // backend context's own resources).
+    for (auto & kv : ctx->graph_cache) {
+        kv.second->destroy(ctx->device);
+    }
+    ctx->graph_cache.clear();
+    ctx->active_graph_cache_entry = nullptr;
 
     ctx->compute_cmd_pool.destroy(ctx->device->device);
     if (ctx->device->async_use_transfer_queue) {
@@ -16366,6 +16473,98 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// Retrieve (or create) the graph cache entry for `uid`. Also periodically
+// evicts entries that haven't been used recently so the cache doesn't grow
+// unbounded when a workload cycles through many distinct graphs.
+// Hard cap on cached graphs to bound the total VkCommandPool / VkDescriptorPool
+// memory we hold across distinct cgraph uids. Workloads like llama-bench cycle
+// through many uids quickly (different prompt sizes, warmup vs measurement);
+// without a cap, descriptor pool creation can fail with OutOfDeviceMemory long
+// before the time-based eviction would have run.
+#define VK_GRAPH_CACHE_MAX_ENTRIES 512
+
+static vk_graph_cache_entry * ggml_vk_graph_cache_get_or_create(ggml_backend_vk_context * ctx, uint64_t uid) {
+    const int64_t time_now = ggml_time_us();
+
+    // sweep every 5s, evicting graphs unused for >=10s
+    if (time_now - ctx->last_graph_cache_eviction_sweep >= 5'000'000) {
+        ctx->last_graph_cache_eviction_sweep = time_now;
+        for (auto it = ctx->graph_cache.begin(); it != ctx->graph_cache.end(); ) {
+            if (time_now - it->second->last_used_time >= 10'000'000) {
+                it->second->destroy(ctx->device);
+                it = ctx->graph_cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    auto it = ctx->graph_cache.find(uid);
+    if (it != ctx->graph_cache.end()) {
+        it->second->last_used_time = time_now;
+        return it->second.get();
+    }
+
+    // When the cache is at capacity we do not evict: the LRU entry might still
+    // have cmd buffers in flight (cache hits submit without waiting on async
+    // backends), and waiting for the device to drain just to destroy one entry
+    // stalls the whole GPU. Instead, skip caching this graph - it will build
+    // without the caching machinery and run as fast as the pre-cache path.
+    // Old entries continue to age out via the 10s time-based sweep above.
+    if (ctx->graph_cache.size() >= VK_GRAPH_CACHE_MAX_ENTRIES) {
+        return nullptr;
+    }
+
+    auto entry = std::make_unique<vk_graph_cache_entry>();
+    entry->uid = uid;
+    entry->last_used_time = time_now;
+    entry->cmd_pool.init(ctx->device, &ctx->device->compute_queue);
+    entry->cmd_pool.cached_graph_pool = true;
+    vk_graph_cache_entry * ptr = entry.get();
+    ctx->graph_cache.emplace(uid, std::move(entry));
+    return ptr;
+}
+
+// Re-submit a cached graph. Hot path - called once per cache hit per subgraph.
+// Skips the vk_context / vk_submission machinery used by the build path: the
+// replay_cbs vector is pre-populated, so this is just one vkQueueSubmit with
+// stack-only auxiliary structures. No heap allocations, no gc.contexts growth.
+static void ggml_vk_graph_cache_resubmit(ggml_backend_vk_context * ctx, vk_graph_cache_entry * entry) {
+    ggml_vk_submit_transfer_ctx(ctx);
+
+    vk_device & dev = ctx->device;
+
+    // We only ever wait on the transfer timeline semaphore to order compute
+    // after any pending transfers that landed since the last submit.
+    vk::Semaphore           wait_sem;
+    uint64_t                wait_val   = 0;
+    vk::PipelineStageFlags  wait_stage = dev->transfer_queue.stage_flags;
+    const bool needs_xfer_wait =
+        dev->async_use_transfer_queue &&
+        ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value;
+    if (needs_xfer_wait) {
+        wait_sem = ctx->transfer_semaphore.s;
+        wait_val = ctx->transfer_semaphore.value;
+        ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+    }
+
+    vk::TimelineSemaphoreSubmitInfo tl_info{
+        needs_xfer_wait ? 1u : 0u, &wait_val,
+        0u, nullptr,
+    };
+    vk::SubmitInfo si{
+        needs_xfer_wait ? 1u : 0u, &wait_sem, &wait_stage,
+        (uint32_t) entry->replay_cbs.size(), entry->replay_cbs.data(),
+        0u, nullptr,
+    };
+    si.setPNext(&tl_info);
+
+    std::lock_guard<std::mutex> guard(queue_mutex);
+    dev->compute_queue.queue.submit({ si }, vk::Fence{});
+
+    ctx->submit_pending = true;
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -16376,6 +16575,65 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         dul.color = std::array<float,4>{1.0f, 1.0f, 1.0f, 1.0f};
         vk_instance.pfn_vkQueueBeginDebugUtilsLabelEXT(ctx->device->compute_queue.queue, reinterpret_cast<VkDebugUtilsLabelEXT*>(&dul));
     }
+
+    // Graph caching: if this cgraph has been seen before (same uid), re-submit
+    // the pre-recorded command buffers instead of rebuilding. Disabled when the
+    // perf logger is on (it needs fresh timestamp queries each run) or when
+    // result checking is compiled in.
+    static const bool vk_graph_cache_disabled = getenv("GGML_VK_DISABLE_GRAPH_CACHE") != nullptr;
+    vk_graph_cache_entry * cache_entry = nullptr;
+    bool cache_hit = false;
+    const bool can_cache = cgraph->uid != 0 && !vk_perf_logger_enabled;
+#if defined(GGML_VULKAN_CHECK_RESULTS)
+    const bool caching_disabled = true;
+#else
+    const bool caching_disabled = vk_graph_cache_disabled;
+#endif
+    if (can_cache && !caching_disabled) {
+        auto it = ctx->graph_cache.find(cgraph->uid);
+        // A hit requires both a fully-built entry AND a matching prealloc
+        // buffer generation. If a different graph has since reallocated any
+        // prealloc_{x,y,split_k,add_rms_partials} buffer, the entry's
+        // descriptor sets bind freed VkBuffer handles and must not be reused.
+        const bool entry_valid = it != ctx->graph_cache.end()
+            && it->second->num_cmd_buffers > 0
+            && it->second->prealloc_buf_generation == ctx->prealloc_buf_generation;
+        if (entry_valid) {
+            cache_entry = it->second.get();
+            cache_entry->last_used_time = ggml_time_us();
+            cache_hit = true;
+        } else {
+            // Drop any stale entry so the new build starts from a clean pool.
+            // Stale here means: partially built, or prealloc generation moved
+            // on (descriptors point to freed buffers).
+            if (it != ctx->graph_cache.end()) {
+                it->second->destroy(ctx->device);
+                ctx->graph_cache.erase(it);
+            }
+            // Only create a cache entry on the second sighting of a uid. For
+            // a one-shot uid, building into a fresh VkCommandPool + VkDescriptorPool
+            // is pure overhead - no future hit will amortize it. Workloads
+            // that rotate through many distinct graphs (e.g. llama-bench) then
+            // stay on the fast pre-cache path.
+            const bool first_sighting = ctx->graph_cache_seen_uids.insert(cgraph->uid).second;
+            if (!first_sighting) {
+                cache_entry = ggml_vk_graph_cache_get_or_create(ctx, cgraph->uid);
+            }
+        }
+    }
+
+    if (cache_hit) {
+        ggml_vk_graph_cache_resubmit(ctx, cache_entry);
+        if (!ctx->device->support_async) {
+            ggml_vk_synchronize(ctx);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    // Redirect command buffer / descriptor set allocations into the cache
+    // entry for the duration of the build. Reset at the end of the function
+    // (or on error) so subsequent non-cached calls behave normally.
+    ctx->active_graph_cache_entry = cache_entry;
 
     ctx->prealloc_size_add_rms_partials_offset = 0;
     ctx->do_add_rms_partials = false;
@@ -16758,6 +17016,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
         ctx->perf_logger->print_timings();
     }
+
+    // If we built into a cache entry, record how many command buffers were
+    // produced so that on a cache hit we know how many to re-submit, snapshot
+    // the prealloc generation we built against, and materialize the flat
+    // replay list that the resubmit path can pass straight to vkQueueSubmit.
+    // Must happen before clearing the active entry.
+    if (cache_entry) {
+        cache_entry->num_cmd_buffers = cache_entry->cmd_pool.cmd_buffers.size();
+        cache_entry->prealloc_buf_generation = ctx->prealloc_buf_generation;
+        cache_entry->replay_cbs.clear();
+        cache_entry->replay_cbs.reserve(cache_entry->num_cmd_buffers);
+        size_t added = 0;
+        for (auto & cb : cache_entry->cmd_pool.cmd_buffers) {
+            if (added >= cache_entry->num_cmd_buffers) break;
+            cache_entry->replay_cbs.push_back(cb.buf);
+            added++;
+        }
+    }
+    ctx->active_graph_cache_entry = nullptr;
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
