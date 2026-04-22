@@ -7006,7 +7006,14 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
-            dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+            // On Intel Xe2 (BMG) the Q8_1 MMVQ SUBGROUP variant (wg=16, 1 subgroup/WG)
+            // leaves the GPU under-occupied for small m: e.g. m=1024 with TP split=4 gives
+            // only 128 WGs/GPU ≈ 2048 SIMD16 lanes, far below the ~4k lanes that can run
+            // concurrently. Switching to LARGE (wg=64, 4 subgroups/WG) for small-m/medium-k
+            // increases active threads per WG 4× and restores latency hiding.
+            if (!(m <= 8192 && k >= 1024)) {
+                dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+            }
         }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
     }
