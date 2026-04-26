@@ -4876,7 +4876,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
             uint32_t lanes_per_column;
             if (S_V >= 128u && device->subgroup_clustered) {
-                lanes_per_column = 8u;
+                // Intel Xe2 SIMD32 spills with rows_per_lane >= 16; halve the per-thread state
+                // by using more lanes per column (LPC=16 gives ROWS_PER_LANE=8 for S_V=128).
+                if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == vk_device_architecture::INTEL_XE2) {
+                    lanes_per_column = std::min(S_V / 8u, device->subgroup_size);
+                } else {
+                    lanes_per_column = 8u;
+                }
             } else {
                 // Use largest power-of-two that divides both S_V and subgroup_size so that
                 // (1) S_V % lanes_per_column == 0 and (2) S_V % (subgroup_size / lanes_per_column) == 0.
