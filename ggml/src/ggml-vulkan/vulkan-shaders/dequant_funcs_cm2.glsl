@@ -279,7 +279,7 @@ f16vec4 dequantFuncQ2_K_v(const in decodeBufQ2_K bl, const in uint blockCoords[2
     return f16vec4(vec4(qi) * vec4(float(d_sub)) - vec4(float(m_sub)));
 }
 
-layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ3_K {
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufQ3_K {
    block_q3_K block;
 };
 
@@ -685,7 +685,7 @@ f16vec4 dequantFuncQ5_K_v(const in decodeBufQ5_K bl, const in uint blockCoords[2
     return f16vec4(vec4(qi) * vec4(d) - vec4(m));
 }
 
-layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufQ6_K {
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer decodeBufQ6_K {
    block_q6_K block;
 };
 
