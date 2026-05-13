@@ -1784,6 +1784,18 @@ class vk_perf_logger {
                           << " GFLOPS/s)";
             }
 
+            auto bit = bytes.find(t.first);
+            if (bit != bytes.end() && (bit->second).size() == t.second.size()) {
+                uint64_t total_op_bytes = 0;
+                for (const auto & elem : bit->second) {
+                    total_op_bytes += elem;
+                }
+                // bytes (1e9) / time_ns (1e9) = GB/s
+                std::cerr << " ("
+                          << double(total_op_bytes) / double(total_op_times)
+                          << " GB/s)";
+            }
+
             total_all_op_times += total_op_times;
 
             std::cerr << std::endl;
@@ -1795,10 +1807,19 @@ class vk_perf_logger {
 
         timings.clear();
         flops.clear();
+        bytes.clear();
     }
 
-    std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops) {
+    static uint64_t tensor_bytes(const ggml_tensor * t) {
+        if (!t) return 0;
+        uint64_t n_rows = 1;
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) n_rows *= t->ne[i];
+        return n_rows * ggml_row_size(t->type, t->ne[0]);
+    }
+
+    std::string get_node_fusion_name(const ggml_tensor * node, const char *fusion_name, uint64_t *n_flops, uint64_t *n_bytes) {
         *n_flops = 0;
+        *n_bytes = 0;
         std::string fusion_str;
         if (fusion_name) {
             fusion_str = fusion_name + std::string(" ");
@@ -1827,6 +1848,17 @@ class vk_perf_logger {
             }
             name = fusion_str + name;
             *n_flops = m * n * (k + (k - 1)) * batch;
+            if (node->op == GGML_OP_MUL_MAT_ID) {
+                const uint64_t n_pairs = node->src[2]->ne[0] * node->src[2]->ne[1];
+                *n_bytes = n_pairs * (m * ggml_row_size(node->src[0]->type, k) + ggml_row_size(node->src[1]->type, k))
+                         + m * n * batch * ggml_type_size(node->type);
+            } else {
+                const uint64_t bw = node->src[0]->ne[2] * node->src[0]->ne[3];
+                const uint64_t ba = node->src[1]->ne[2] * node->src[1]->ne[3];
+                *n_bytes = bw * m * ggml_row_size(node->src[0]->type, k)
+                         + ba * n * ggml_row_size(node->src[1]->type, k)
+                         + m * n * batch * ggml_type_size(node->type);
+            }
             return name;
         }
         if (node->op == GGML_OP_CONV_2D || node->op == GGML_OP_CONV_TRANSPOSE_2D) {
@@ -1870,6 +1902,7 @@ class vk_perf_logger {
                 " v(" << v->ne[0] << "," << v->ne[1] << "," << v->ne[2] << "," << v->ne[3] << "), " <<
                 " m(" << (m?m->ne[0]:0) << "," << (m?m->ne[1]:0) << "," << (m?m->ne[2]:0) << "," << (m?m->ne[3]:0) << ")";
             *n_flops = 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
+            *n_bytes = tensor_bytes(q) + tensor_bytes(k) + tensor_bytes(v) + tensor_bytes(m) + tensor_bytes(dst);
             return name.str();
         }
         if (node->op == GGML_OP_TOP_K) {
@@ -1884,21 +1917,27 @@ class vk_perf_logger {
     }
 
     void log_timing(const ggml_tensor * node, const char *fusion_name, uint64_t time) {
-        uint64_t n_flops;
-        std::string name = get_node_fusion_name(node, fusion_name, &n_flops);
+        uint64_t n_flops, n_bytes;
+        std::string name = get_node_fusion_name(node, fusion_name, &n_flops, &n_bytes);
         if (n_flops) {
             flops[name].push_back(n_flops);
+        }
+        if (n_bytes) {
+            bytes[name].push_back(n_bytes);
         }
         timings[name].push_back(time);
     }
 
     void log_timing(const std::vector<ggml_tensor *> &nodes, const std::vector<const char *> &names, uint64_t time) {
         uint64_t total_flops = 0;
+        uint64_t total_bytes = 0;
         std::string name;
         for (size_t n = 0; n < nodes.size(); ++n) {
             uint64_t n_flops = 0;
-            name += get_node_fusion_name(nodes[n], names[n], &n_flops);
+            uint64_t n_bytes = 0;
+            name += get_node_fusion_name(nodes[n], names[n], &n_flops, &n_bytes);
             total_flops += n_flops;
+            total_bytes += n_bytes;
 
             if (n != nodes.size() - 1) {
                 name += ", ";
@@ -1907,12 +1946,16 @@ class vk_perf_logger {
         if (total_flops) {
             flops[name].push_back(total_flops);
         }
+        if (total_bytes) {
+            bytes[name].push_back(total_bytes);
+        }
         timings[name].push_back(time);
     }
 
   private:
     std::map<std::string, std::vector<uint64_t>> timings;
     std::map<std::string, std::vector<uint64_t>> flops;
+    std::map<std::string, std::vector<uint64_t>> bytes;
     uint32_t print_count {};
 };
 
