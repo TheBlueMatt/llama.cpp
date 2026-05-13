@@ -14502,7 +14502,7 @@ bool ggml_backend_vk_allreduce_tensor(ggml_backend_t * backends, ggml_tensor ** 
         }
         auto * bctx = (ggml_backend_vk_buffer_context *) tensors[j]->buffer->context;
         src_bufs[j] = &bctx->dev_buffer;
-        src_offs[j] = vk_tensor_offset(tensors[j]) + tensors[j]->view_offs;
+        src_offs[j] = vk_tensor_view_offset(tensors[j]);
         if (src_bufs[j]->get()->device.get() != ctxs[j]->device.get()) {
             return false;
         }
