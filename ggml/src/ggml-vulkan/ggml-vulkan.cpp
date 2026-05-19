@@ -6719,6 +6719,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->almost_ready_fence = ctx->device->device.createFence({});
 
     ctx->compute_cmd_pool.init(ctx->device, &ctx->device->compute_queue);
+
     if (ctx->device->async_use_transfer_queue) {
         vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
         vk::SemaphoreCreateInfo ci{};
@@ -15399,229 +15400,134 @@ bool ggml_backend_vk_allreduce_tensor(ggml_backend_t * backends, ggml_tensor ** 
     uint32_t elements1 = (ne > 262144) ? 512 : (ne > 512 ? (uint32_t)CEIL_DIV(ne, 512) : 1);
     uint32_t elements2 = (ne > 262144) ? (uint32_t)CEIL_DIV(ne, 262144) : 1;
 
-    // GPU-synced path: instead of CPU fence-waiting for each backend's
-    // compute to finish, piggyback a "compute-done" timeline semaphore
-    // signal onto the final compute submission, and have allreduce
-    // round 0 wait on peers' compute-done semaphores. Eliminates
-    // ~35ms/token of CPU fence waits for Qwen (84 subgraphs).
+    // GPU-only synchronization: allreduce uses two ggml_vk_submit calls per
+    // device. The split mirrors the prior implementation's pattern - it lets
+    // the announce (which signals compute_done that peers' first butterfly
+    // round waits on) submit immediately, while we keep building the
+    // butterfly cmd buffers on the CPU in parallel with peers' GPUs.
+    //
+    //   Step 1 (announce): empty cmd buffer (or barrier+fillBuffer when the
+    //                      allreduce target's compute was disabled on this
+    //                      device). Signals allreduce_tl_sema at base + 1
+    //                      ("compute_done"). The auto-injected compute_tl
+    //                      wait holds it back until prior graph_compute work
+    //                      on this queue has completed.
+    //
+    //   Step 2 (butterfly + tail): the actual reduction. Each round is its
+    //                      own vk_submission inside one compute_ctx, chained
+    //                      to its peers via allreduce_tl_sema; the whole
+    //                      compute_ctx is submitted as one vkQueueSubmit.
+    //                      Cross-device-to-this-device sync is via
+    //                      allreduce_tl_sema (self-wait for round-r-1 result
+    //                      visibility, peer-wait for RAW + prior-round-peer
+    //                      WAR). No compute_tl wait here - Step 1's submit
+    //                      already chained us behind prior compute.
+    //
+    // Round-signal scheme on allreduce_tl_sema:
+    //   announce         : base + 1                   (== "compute_done")
+    //   sub_idx i (pow2) : base + 2 + i
+    //   tail copy        : base + 2 + n_butterfly_rounds
+    //   excess writeback : base + 1 + n_compute_rounds  (== same as pow2 final, so
+    //                      every device ends at the same value).
+    //
+    // tl_advance per device (uniform):
+    //   = 1 + n_compute_rounds + (need_final_copy ? 1 : 0)
     static thread_local int allreduce_cleanup_counter = 0;
     bool need_cleanup = (++allreduce_cleanup_counter >= 16);
 
-    // Step 1: Flush pending compute commands and signal compute-done.
-    // We submit the compute-done signal on a command buffer containing a
-    // full pipeline barrier.  A bare empty or no-op submit is unreliable
-    // on some drivers (Mesa ANV) for cross-device timeline semaphore
-    // propagation, but a command buffer with a real pipeline barrier
-    // forces the driver to process it as a non-trivial submission.
     for (size_t j = 0; j < n_backends; j++) {
         auto * ctx = ctxs[j];
         auto & dev = ctx->device;
         std::lock_guard<std::recursive_mutex> guard(dev->mutex);
 
-        // Flush transfer context if pending
+        // Flush pending transfers. The transfer signal will be picked up by
+        // the compute submission below via ggml_vk_get_compute_ctx, which
+        // adds a transfer_semaphore wait when there's an unwaited transfer.
         if (ggml_vk_submit_transfer_ctx(ctx)) {
             ctx->submit_pending = true;
         }
 
-        // Submit the compute context with compute-done signal attached.
-        uint64_t signal_value = dev->allreduce_tl_value + 1;
-        vk_semaphore compute_done_signal{dev->allreduce_tl_sema, signal_value};
-        bool signaled = false;
+        // compute_ctx may already hold pending graph_compute work that wasn't
+        // submitted yet (rare - graph_compute usually drains itself); that
+        // work executes first in this vkQueueSubmit. Ordering against prior
+        // submissions to this queue (this device's prior graph_compute and
+        // allreduce) is left to Vulkan's submission-order rules and timeline
+        // semaphore monotonicity on allreduce_tl_sema, which together give
+        // the cross-vkQueueSubmit memory visibility we need without an extra
+        // explicit fence semaphore.
+        vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
-        if (!ctx->compute_ctx.expired()) {
-            auto compute_ctx = ctx->compute_ctx.lock();
-            // If the allreduce target's compute was disabled (zero-sized source slice),
-            // zero its buffer before ending the context.  The barrier ensures prior
-            // compute dispatches in the same command buffer finish before the fill.
-            if (!(tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-                if (compute_ctx->s == nullptr) {
-                    ggml_vk_ctx_begin(dev, compute_ctx);
-                }
-                vk::MemoryBarrier mb_fill{
-                    vk::AccessFlagBits::eMemoryWrite,
-                    vk::AccessFlagBits::eTransferWrite,
-                };
-                compute_ctx->s->buffer->buf.pipelineBarrier(
-                    vk::PipelineStageFlagBits::eAllCommands,
-                    vk::PipelineStageFlagBits::eTransfer,
-                    {}, { mb_fill }, {}, {});
-                compute_ctx->s->buffer->buf.fillBuffer(
-                    src_bufs[j]->get()->buffer,
-                    (vk::DeviceSize)src_offs[j],
-                    (vk::DeviceSize)nbytes,
-                    0);
-            }
-            ggml_vk_ctx_end(compute_ctx);
-            for (auto& cpy : compute_ctx->in_memcpys) {
-                memcpy(cpy.dst, cpy.src, cpy.n);
-            }
-
-            if (!compute_ctx->seqs.empty()) {
-                // Piggyback onto the last compute submission
-                auto & last_sub = compute_ctx->seqs.back().back();
-                if (dev->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
-                    last_sub.wait_semaphores.push_back(ctx->transfer_semaphore);
-                    ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
-                }
-                last_sub.signal_semaphores.push_back(compute_done_signal);
-                ggml_vk_submit(compute_ctx, {});
-                signaled = true;
-            } else {
-                ggml_vk_submit(compute_ctx, {}); // no-op (seqs already submitted)
-            }
+        // Empty cmd buffer (or fillBuffer for the disabled-tensor case) that
+        // signals dev->allreduce_tl_sema at compute_done = base + 1. Peers
+        // wait on this for their first round's cross-device read. If
+        // get_compute_ctx just allocated a fresh context, it already started
+        // a (still empty) submission for us; reuse it. Otherwise start one.
+        if (compute_ctx->s == nullptr) {
+            ggml_vk_ctx_begin(dev, compute_ctx);
         }
-
-        // Edge case: no compute submission to carry the signal (e.g. empty
-        // subgraph).  Emit it from a standalone barrier command buffer.
-        if (!signaled) {
-            vk_context signal_ctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
-            ggml_vk_ctx_begin(dev, signal_ctx);
-            // Barrier first: flush all prior compute/transfer writes from
-            // GPU caches before we overwrite the buffer with fillBuffer.
-            // Without this ordering, the fill (a transfer write) can race
-            // with L2 cache writeback of prior compute results on the same
-            // buffer region, causing the zeros to be clobbered.
-            vk::MemoryBarrier mb{
+        if (!(tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            // Allreduce target's compute was disabled on this device (e.g.,
+            // zero-sized source slice). Zero our slice so it doesn't add
+            // garbage to the sum across devices. The barrier ensures prior
+            // compute dispatches finish before the fillBuffer.
+            vk::MemoryBarrier mb_fill{
                 vk::AccessFlagBits::eMemoryWrite,
-                vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eMemoryRead,
+                vk::AccessFlagBits::eTransferWrite,
             };
-            signal_ctx->s->buffer->buf.pipelineBarrier(
+            compute_ctx->s->buffer->buf.pipelineBarrier(
                 vk::PipelineStageFlagBits::eAllCommands,
-                vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eAllCommands,
-                {}, { mb }, {}, {});
-            // Zero disabled tensors AFTER the barrier so peers see clean zeros.
-            if (!(tensors[j]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-                signal_ctx->s->buffer->buf.fillBuffer(
-                    src_bufs[j]->get()->buffer,
-                    (vk::DeviceSize)src_offs[j],
-                    (vk::DeviceSize)nbytes,
-                    0);
-            }
-            auto & sub = signal_ctx->seqs.back().back();
-            if (dev->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
-                sub.wait_semaphores.push_back(ctx->transfer_semaphore);
-                ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
-            }
-            sub.signal_semaphores.push_back(compute_done_signal);
-            ggml_vk_ctx_end(signal_ctx);
-            ggml_vk_submit(signal_ctx, {});
+                vk::PipelineStageFlagBits::eTransfer,
+                {}, { mb_fill }, {}, {});
+            compute_ctx->s->buffer->buf.fillBuffer(
+                src_bufs[j]->get()->buffer,
+                (vk::DeviceSize)src_offs[j],
+                (vk::DeviceSize)nbytes,
+                0);
         }
-
-        ctx->submit_pending = false;
-
-        // Release compute context for next subgraph (don't wait for GPU)
-        if (!ctx->compute_ctx.expired()) {
-            ctx->compute_ctx.reset();
-        }
-    }
-
-    // Step 2: Record and submit allreduce commands.
-    //
-    // Submission layout per device (sub_idx is 0-indexed within the device's queue submit):
-    //
-    //   pow2 path (n_excess == 0), every device:
-    //     sub_idx 0..n_butterfly_rounds-1 : butterfly P2P add, ping-pong local<->scratch.
-    //     sub_idx n_butterfly_rounds      : (only if need_final_copy) scratch->local copy.
-    //
-    //   non-pow2 path:
-    //     pow2 device (j < n_pow2):
-    //       sub_idx 0                          : pre-fold.
-    //         j < n_excess               : P2P add absorbing excess partner (j+n_pow2).
-    //                                     in_place_pre_fold ? writes local : writes scratch.
-    //         j in [n_excess, n_pow2)    : in_place_pre_fold ? barrier-only no-op
-    //                                                        : local->scratch buffer copy.
-    //       sub_idx 1..n_butterfly_rounds      : butterfly P2P add, ping-pong.
-    //     excess device (j >= n_pow2):
-    //       sub_idx 0                          : P2P copy peer(j-n_pow2).local -> own local.
-    //
-    // Signal scheme:
-    //   compute_done is signaled at base + 1 by Step 1 (piggybacked on compute).
-    //   For pow2 devices, each compute sub_idx i signals base + 2 + i, with the
-    //   optional pow2-path tail copy signaling base + 2 + n_butterfly_rounds.
-    //   Excess devices skip every intermediate value and signal directly at
-    //   base + 1 + n_compute_rounds — this matches the pow2 cohort's final
-    //   signal so the cleanup wait below sees a uniform end value.
-    //
-    // tl_advance per device (uniform; computed once below):
-    //   = 1 + n_compute_rounds + (need_final_copy ? 1 : 0)
-    //   For pow2 path:     1 + n_butterfly_rounds + (need_final_copy ? 1 : 0)
-    //   For non-pow2 path: 1 + n_compute_rounds  (the non-pow2 path zeroes out
-    //     need_final_copy by construction — see the parity argument above).
-
-    for (size_t j = 0; j < n_backends; j++) {
-        auto & ctx = ctxs[j];
-        auto & dev = ctx->device;
-        std::lock_guard<std::recursive_mutex> guard(dev->mutex);
+        ggml_vk_ctx_end(compute_ctx);
+        compute_ctx->seqs.back().back().signal_semaphores.push_back(
+            {dev->allreduce_tl_sema, dev->allreduce_tl_value + 1});
 
         const bool is_excess = !is_pow2 && (j >= n_pow2);
-        size_t n_subs;
-        if (is_excess) {
-            n_subs = 1;
-        } else if (is_pow2) {
-            n_subs = n_butterfly_rounds + (need_final_copy ? 1 : 0);
-        } else {
-            n_subs = n_compute_rounds;  // 1 pre-fold + n_butterfly_rounds butterfly
-        }
 
-        std::vector<vk::CommandBuffer>                   cmd_bufs(n_subs);
-        std::vector<vk::SubmitInfo>                      submits(n_subs);
-        std::vector<vk::TimelineSemaphoreSubmitInfo>     tl_infos(n_subs);
-        std::vector<std::vector<vk::Semaphore>>          wait_semas(n_subs);
-        std::vector<std::vector<uint64_t>>               wait_vals(n_subs);
-        std::vector<std::vector<vk::PipelineStageFlags>> wait_stages(n_subs);
-        std::vector<vk::Semaphore>                       signal_semas(n_subs);
-        std::vector<uint64_t>                            signal_vals(n_subs);
-
+        // --- Excess device: single write-back ---
         if (is_excess) {
-            // ----- Excess device: single write-back submission. -----
-            // Result of the butterfly always lives in our pow2 partner's local
-            // (we picked the pre-fold parity so the cohort ends in local), so a
-            // straight P2P copy completes our AllReduce.
             const size_t peer = j - n_pow2;
             auto & peer_dev = ctxs[peer]->device;
             vk::Buffer peer_local_vk_buf = ggml_vk_get_or_import_peer_buffer(*src_bufs[peer], dev.get());
 
-            // Use cpy_f32_f32 (compute stage) rather than vkCmdCopyBuffer
+            // cpy_f32_f32 (compute stage) rather than vkCmdCopyBuffer
             // (transfer stage): the source is a cross-device imported buffer,
             // and transfer-stage cross-device reads don't reliably observe
-            // peer's prior compute writes on Intel BMG even with the semaphore
-            // signal/wait pair (the L3 doesn't drain). Compute-stage reads work
-            // for the same reason the butterfly's P2P shader reads work above.
-            vk_context subctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
-            ggml_vk_ctx_begin(dev, subctx);
-            vk::DescriptorBufferInfo src_dbi{ peer_local_vk_buf,             (vk::DeviceSize)src_offs[peer], (vk::DeviceSize)nbytes };
-            vk::DescriptorBufferInfo dst_dbi{ src_bufs[j]->get()->buffer,    (vk::DeviceSize)src_offs[j],    (vk::DeviceSize)nbytes };
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipelines_cpy[j],
+            // peer's prior compute writes on Intel BMG even with a semaphore
+            // signal/wait pair (the L3 doesn't drain). Compute-stage reads
+            // work for the same reason the butterfly's P2P shader reads work
+            // below.
+            ggml_vk_ctx_begin(dev, compute_ctx);
+            vk::DescriptorBufferInfo src_dbi{ peer_local_vk_buf,          (vk::DeviceSize)src_offs[peer], (vk::DeviceSize)nbytes };
+            vk::DescriptorBufferInfo dst_dbi{ src_bufs[j]->get()->buffer, (vk::DeviceSize)src_offs[j],    (vk::DeviceSize)nbytes };
+            ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipelines_cpy[j],
                 { src_dbi, dst_dbi }, pc_cpy, { elements0, elements1, elements2 });
-            ggml_vk_ctx_end(subctx);
-            GGML_ASSERT(!subctx->seqs.empty() && !subctx->seqs[0].empty());
-            cmd_bufs[0] = subctx->seqs[0][0].buffer->buf;
+            ggml_vk_ctx_end(compute_ctx);
 
-            // Self-wait on own compute_done (cross-submit-batch ordering is not implicit).
-            wait_semas[0].push_back(dev->allreduce_tl_sema);
-            wait_vals[0].push_back(dev->allreduce_tl_value + 1);
-            wait_stages[0].push_back(vk::PipelineStageFlagBits::eAllCommands);
-            // Peer-wait on partner's last butterfly signal — RAW for the data we
-            // read AND WAR for our own local (peer read our local during pre-fold;
-            // peer's last-butterfly signal is later than the pre-fold signal).
-            {
-                vk::Semaphore peer_sema = dev->allreduce_peer_semas[peer_dev->idx];
-                wait_semas[0].push_back(peer_sema);
-                wait_vals[0].push_back(peer_dev->allreduce_tl_value + 1 + n_compute_rounds);
-                wait_stages[0].push_back(vk::PipelineStageFlagBits::eAllCommands);
-            }
-            signal_semas[0] = dev->allreduce_tl_sema;
-            signal_vals[0]  = dev->allreduce_tl_value + 1 + n_compute_rounds;
+            auto & last_sub = compute_ctx->seqs.back().back();
+            // Peer-wait on partner's last butterfly signal — RAW for the
+            // data we read.
+            last_sub.wait_semaphores.push_back({
+                dev->allreduce_peer_semas[peer_dev->idx],
+                peer_dev->allreduce_tl_value + 1 + n_compute_rounds,
+            });
+            last_sub.signal_semaphores.push_back({
+                dev->allreduce_tl_sema,
+                dev->allreduce_tl_value + 1 + n_compute_rounds,
+            });
         } else {
-            // ----- Pow2 device (j < n_pow2): pre-fold (non-pow2) + butterfly + optional pow2 tail copy. -----
+            // --- Pow2 device: optional pre-fold + butterfly + optional tail copy ---
+            const size_t bf_start_idx = is_pow2 ? 0 : 1;  // first sub_idx of butterfly
 
-            const size_t bf_start_idx = is_pow2 ? 0 : 1;  // first sub_idx used by butterfly rounds
-
-            // --- Pre-fold (non-pow2 path only) at sub_idx 0 ---
+            // --- Pre-fold (non-pow2 only) at sub_idx 0 ---
             if (!is_pow2) {
-                vk_context subctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
-                ggml_vk_ctx_begin(dev, subctx);
-
+                ggml_vk_ctx_begin(dev, compute_ctx);
                 if (j < n_excess) {
                     // Receiver: P2P add absorbing the excess partner.
                     //   in_place_pre_fold: own.local = own.local + peer.local
@@ -15638,64 +15544,58 @@ bool ggml_backend_vk_allreduce_tensor(ggml_backend_t * backends, ggml_tensor ** 
                     vk::DescriptorBufferInfo src0_dbi{ (VkBuffer)local_buf->buffer, (vk::DeviceSize)src_offs[j],    (vk::DeviceSize)nbytes };
                     vk::DescriptorBufferInfo src1_dbi{ peer_local_vk_buf,           (vk::DeviceSize)src_offs[peer], (vk::DeviceSize)nbytes };
                     vk::DescriptorBufferInfo dst_dbi { my_dst_buf,                  my_dst_off,                     (vk::DeviceSize)nbytes };
-                    ggml_vk_dispatch_pipeline(ctx, subctx, pipelines_add[j],
+                    ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipelines_add[j],
                         { src0_dbi, src1_dbi, dst_dbi, src0_dbi }, pc, { elements0, elements1, elements2 });
                 } else {
                     // Non-receiver j in [n_excess, n_pow2):
-                    //   scratch pre-fold : local -> scratch via cpy_f32_f32 compute dispatch
-                    //                      (NOT vkCmdCopyBuffer — peers read our scratch
-                    //                      cross-device next round, and transfer-stage
-                    //                      writes don't drain BMG's L3 even with a
-                    //                      semaphore signal/wait pair).
-                    //   in_place         : barrier-only no-op (round 1 reads local; data
-                    //                      already there).
-                    // Either way, signals pre-fold-done at +2 so pow2 partners can wait
-                    // uniformly.
+                    //   scratch pre-fold : local -> scratch via cpy_f32_f32
+                    //                      (NOT vkCmdCopyBuffer — peers read
+                    //                      our scratch cross-device next round,
+                    //                      and transfer-stage writes don't
+                    //                      drain BMG's L3 even with a semaphore
+                    //                      signal/wait pair).
+                    //   in_place         : barrier-only no-op (round 1 reads
+                    //                      local; data already there).
                     if (in_place_pre_fold) {
                         vk::MemoryBarrier mb{
                             vk::AccessFlagBits::eMemoryWrite,
                             vk::AccessFlagBits::eMemoryRead,
                         };
-                        subctx->s->buffer->buf.pipelineBarrier(
+                        compute_ctx->s->buffer->buf.pipelineBarrier(
                             vk::PipelineStageFlagBits::eAllCommands,
                             vk::PipelineStageFlagBits::eAllCommands,
                             {}, { mb }, {}, {});
                     } else {
-                        vk::DescriptorBufferInfo src_dbi{ (VkBuffer)src_bufs[j]->get()->buffer, (vk::DeviceSize)src_offs[j], (vk::DeviceSize)nbytes };
-                        vk::DescriptorBufferInfo dst_dbi{ (VkBuffer)dev->allreduce_scratch->buffer, (vk::DeviceSize)0,          (vk::DeviceSize)nbytes };
-                        ggml_vk_dispatch_pipeline(ctx, subctx, pipelines_cpy[j],
+                        vk::DescriptorBufferInfo src_dbi{ (VkBuffer)src_bufs[j]->get()->buffer,     (vk::DeviceSize)src_offs[j], (vk::DeviceSize)nbytes };
+                        vk::DescriptorBufferInfo dst_dbi{ (VkBuffer)dev->allreduce_scratch->buffer, (vk::DeviceSize)0,           (vk::DeviceSize)nbytes };
+                        ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipelines_cpy[j],
                             { src_dbi, dst_dbi }, pc_cpy, { elements0, elements1, elements2 });
                     }
                 }
-                ggml_vk_ctx_end(subctx);
-                GGML_ASSERT(!subctx->seqs.empty() && !subctx->seqs[0].empty());
-                cmd_bufs[0] = subctx->seqs[0][0].buffer->buf;
+                ggml_vk_ctx_end(compute_ctx);
 
-                // Self-wait on own compute_done.
-                wait_semas[0].push_back(dev->allreduce_tl_sema);
-                wait_vals[0].push_back(dev->allreduce_tl_value + 1);
-                wait_stages[0].push_back(vk::PipelineStageFlagBits::eAllCommands);
-                // Receivers wait on the excess partner's compute_done for the P2P read.
+                auto & last_sub = compute_ctx->seqs.back().back();
+                // Receivers wait on the excess partner's compute_done.
                 if (j < n_excess) {
                     const size_t peer = j + n_pow2;
                     auto & peer_dev = ctxs[peer]->device;
-                    vk::Semaphore peer_sema = dev->allreduce_peer_semas[peer_dev->idx];
-                    wait_semas[0].push_back(peer_sema);
-                    wait_vals[0].push_back(peer_dev->allreduce_tl_value + 1);
-                    wait_stages[0].push_back(vk::PipelineStageFlagBits::eAllCommands);
+                    last_sub.wait_semaphores.push_back({
+                        dev->allreduce_peer_semas[peer_dev->idx],
+                        peer_dev->allreduce_tl_value + 1,
+                    });
                 }
-                signal_semas[0] = dev->allreduce_tl_sema;
-                signal_vals[0]  = dev->allreduce_tl_value + 2;
+                last_sub.signal_semaphores.push_back({dev->allreduce_tl_sema, dev->allreduce_tl_value + 2});
             }
 
             // --- Butterfly rounds ---
             //
             // Ping-pong read-buffer rule (data location at the start of sub_idx i):
             //   ping_pong_shifted = !is_pow2 && in_place_pre_fold
-            //     true  : read_local = (i == 0 || i is odd)  — pre-fold left data in local,
-            //             so first butterfly (sub_idx 1) still reads local.
-            //     false : read_local = (i is even)           — pow2 path or scratch pre-fold.
-
+            //     true  : read_local = (i == 0 || i is odd) — pre-fold left
+            //             data in local, so first butterfly (sub_idx 1) still
+            //             reads local.
+            //     false : read_local = (i is even) — pow2 path or scratch
+            //             pre-fold.
             for (size_t br = 0; br < n_butterfly_rounds; br++) {
                 const size_t sub_idx = bf_start_idx + br;
                 const size_t offset  = (size_t)1 << br;
@@ -15720,49 +15620,45 @@ bool ggml_backend_vk_allreduce_tensor(ggml_backend_t * backends, ggml_tensor ** 
                 vk::Buffer peer_src_vk_buf  = ggml_vk_get_or_import_peer_buffer(peer_src_src_buf, dev.get());
                 const vk::DeviceSize peer_src_off = read_local ? (vk::DeviceSize)src_offs[peer] : (vk::DeviceSize)0;
 
-                vk_context subctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
-                ggml_vk_ctx_begin(dev, subctx);
+                ggml_vk_ctx_begin(dev, compute_ctx);
                 vk::DescriptorBufferInfo src0_dbi{ my_src_buf,       my_src_off,   (vk::DeviceSize)nbytes };
                 vk::DescriptorBufferInfo src1_dbi{ peer_src_vk_buf,  peer_src_off, (vk::DeviceSize)nbytes };
                 vk::DescriptorBufferInfo dst_dbi { my_dst_buf,       my_dst_off,   (vk::DeviceSize)nbytes };
-                ggml_vk_dispatch_pipeline(ctx, subctx, pipelines_add[j],
+                ggml_vk_dispatch_pipeline(ctx, compute_ctx, pipelines_add[j],
                     { src0_dbi, src1_dbi, dst_dbi, src0_dbi }, pc, { elements0, elements1, elements2 });
-                ggml_vk_ctx_end(subctx);
-                GGML_ASSERT(!subctx->seqs.empty() && !subctx->seqs[0].empty());
-                cmd_bufs[sub_idx] = subctx->seqs[0][0].buffer->buf;
+                ggml_vk_ctx_end(compute_ctx);
 
-                // Self-wait on our prior signal. For sub_idx 0 in the pow2 path this
-                // is compute_done (base + 1); otherwise it's the previous round
-                // signal (base + 2 + (sub_idx - 1) == base + 1 + sub_idx).
-                wait_semas[sub_idx].push_back(dev->allreduce_tl_sema);
-                wait_vals[sub_idx].push_back(dev->allreduce_tl_value + 1 + sub_idx);
-                wait_stages[sub_idx].push_back(vk::PipelineStageFlagBits::eAllCommands);
+                auto & last_sub = compute_ctx->seqs.back().back();
+                // Self-wait on our prior round signal. Within a single
+                // vkQueueSubmit, batches are not implicitly ordered for
+                // execution, so we need an explicit semaphore chain to make
+                // round r's read of our buffer see round r-1's write.
+                last_sub.wait_semaphores.push_back({dev->allreduce_tl_sema, dev->allreduce_tl_value + 1 + sub_idx});
 
-                // Peer-wait (RAW): peer wrote the src buffer we're about to read
-                // in their prior round. Same formula as the self-wait, just on
-                // the peer's timeline.
-                wait_semas[sub_idx].push_back(peer_sema);
-                wait_vals[sub_idx].push_back(peer_dev->allreduce_tl_value + 1 + sub_idx);
-                wait_stages[sub_idx].push_back(vk::PipelineStageFlagBits::eAllCommands);
+                // Peer-wait (RAW): peer wrote the src buffer we're about to
+                // read in their prior round. Same formula as the self-wait,
+                // just on the peer's timeline.
+                last_sub.wait_semaphores.push_back({peer_sema, peer_dev->allreduce_tl_value + 1 + sub_idx});
 
-                // Prior-round peer (WAR): in round (sub_idx - 1) the peer at offset
-                // 2^(br-1) read from us; we now write the same buffer (X[r-1] and
-                // X[r+1] share parity). Skip when there is no prior butterfly round
-                // — at br == 0 the prior submission is either nothing (pow2 path) or
-                // pre-fold (non-pow2 path). In neither case did a pow2 partner read
-                // a buffer we're about to write: pre-fold's only cross-device read
-                // targets excess locals, not pow2 buffers.
+                // Prior-round peer (WAR): in round (sub_idx - 1) the peer at
+                // offset 2^(br-1) read from us; we now write the same buffer
+                // (X[r-1] and X[r+1] share parity). Skip when there is no
+                // prior butterfly round - at br == 0 the prior submission is
+                // either nothing (pow2 path) or pre-fold (non-pow2 path). In
+                // neither case did a pow2 partner read a buffer we're about
+                // to write: pre-fold's only cross-device read targets excess
+                // locals, not pow2 buffers. (The cross-allreduce carryover
+                // WAR is handled by the announce's all-peers wait above.)
                 if (br >= 1) {
                     const size_t prev_peer = j ^ (offset / 2);
                     auto & prev_peer_dev = ctxs[prev_peer]->device;
-                    vk::Semaphore prev_peer_sema = dev->allreduce_peer_semas[prev_peer_dev->idx];
-                    wait_semas[sub_idx].push_back(prev_peer_sema);
-                    wait_vals[sub_idx].push_back(prev_peer_dev->allreduce_tl_value + 1 + sub_idx);
-                    wait_stages[sub_idx].push_back(vk::PipelineStageFlagBits::eAllCommands);
+                    last_sub.wait_semaphores.push_back({
+                        dev->allreduce_peer_semas[prev_peer_dev->idx],
+                        prev_peer_dev->allreduce_tl_value + 1 + sub_idx,
+                    });
                 }
 
-                signal_semas[sub_idx] = dev->allreduce_tl_sema;
-                signal_vals[sub_idx]  = dev->allreduce_tl_value + 2 + sub_idx;
+                last_sub.signal_semaphores.push_back({dev->allreduce_tl_sema, dev->allreduce_tl_value + 2 + sub_idx});
             }
 
             // --- Optional pow2-path tail scratch -> local copy ---
@@ -15770,102 +15666,41 @@ bool ggml_backend_vk_allreduce_tensor(ggml_backend_t * backends, ggml_tensor ** 
             // direction so the butterfly already ends in local.
             if (need_final_copy) {
                 const size_t si = n_butterfly_rounds;
-                vk_context subctx = ggml_vk_create_temporary_context(dev->compute_queue.cmd_pool);
-                ggml_vk_ctx_begin(dev, subctx);
+                ggml_vk_ctx_begin(dev, compute_ctx);
                 vk::BufferCopy region{ 0, (vk::DeviceSize)src_offs[j], (vk::DeviceSize)nbytes };
-                subctx->s->buffer->buf.copyBuffer(
+                compute_ctx->s->buffer->buf.copyBuffer(
                     dev->allreduce_scratch->buffer, src_bufs[j]->get()->buffer, { region });
-                ggml_vk_ctx_end(subctx);
-                GGML_ASSERT(!subctx->seqs.empty() && !subctx->seqs[0].empty());
-                cmd_bufs[si] = subctx->seqs[0][0].buffer->buf;
+                ggml_vk_ctx_end(compute_ctx);
 
+                auto & last_sub = compute_ctx->seqs.back().back();
                 // Self-wait on the last butterfly round.
-                wait_semas[si].push_back(dev->allreduce_tl_sema);
-                wait_vals[si].push_back(dev->allreduce_tl_value + 1 + si);
-                wait_stages[si].push_back(vk::PipelineStageFlagBits::eAllCommands);
-                // WAR with the last-butterfly peer: n_butterfly_rounds is odd
-                // here, so the last round had read_local=true and the peer at
-                // offset 2^(n_butterfly_rounds-1) read our local across PCIe.
+                last_sub.wait_semaphores.push_back({dev->allreduce_tl_sema, dev->allreduce_tl_value + 1 + si});
+                // WAR with last-butterfly peer: n_butterfly_rounds is odd
+                // here, so the last round had read_local=true and the peer
+                // at offset 2^(n_butterfly_rounds-1) read our local across
+                // PCIe.
                 {
                     const size_t last_peer = j ^ ((size_t)1 << (n_butterfly_rounds - 1));
                     auto & last_peer_dev = ctxs[last_peer]->device;
-                    vk::Semaphore last_peer_sema = dev->allreduce_peer_semas[last_peer_dev->idx];
-                    wait_semas[si].push_back(last_peer_sema);
-                    wait_vals[si].push_back(last_peer_dev->allreduce_tl_value + 1 + si);
-                    wait_stages[si].push_back(vk::PipelineStageFlagBits::eAllCommands);
+                    last_sub.wait_semaphores.push_back({
+                        dev->allreduce_peer_semas[last_peer_dev->idx],
+                        last_peer_dev->allreduce_tl_value + 1 + si,
+                    });
                 }
-                signal_semas[si] = dev->allreduce_tl_sema;
-                signal_vals[si]  = dev->allreduce_tl_value + 2 + si;
+                last_sub.signal_semaphores.push_back({dev->allreduce_tl_sema, dev->allreduce_tl_value + 2 + si});
             }
         }
 
-        for (size_t si = 0; si < n_subs; si++) {
-            tl_infos[si] = vk::TimelineSemaphoreSubmitInfo{
-                (uint32_t)wait_vals[si].size(), wait_vals[si].data(),
-                1, &signal_vals[si],
-            };
-            submits[si] = vk::SubmitInfo{
-                (uint32_t)wait_semas[si].size(), wait_semas[si].data(),
-                wait_stages[si].data(),
-                1, &cmd_bufs[si],
-                1, &signal_semas[si],
-            };
-            submits[si].pNext = &tl_infos[si];
-        }
-
-        {
-            std::lock_guard<std::mutex> guard2(queue_mutex);
-            dev->compute_queue.queue.submit(submits, vk::Fence{});
-        }
-    }
-
-    // All devices end the allreduce at base + 1 + n_compute_rounds + (need_final_copy ? 1 : 0).
-    // Excess devices get there by jumping straight from compute_done; pow2
-    // devices walk through every intermediate value.
-    const uint64_t tl_advance = 1 + n_compute_rounds + (need_final_copy ? 1 : 0);
-    for (size_t j = 0; j < n_backends; j++) {
-        ctxs[j]->device->allreduce_tl_value += tl_advance;
-    }
-
-    // Hand the next subgraph's compute the wait it needs to see our writes.
-    //
-    // Step 1 reset every backend's compute_ctx, so the first op of the next
-    // subgraph will allocate a fresh one. Seed that fresh context here with a
-    // wait on this device's allreduce_tl_sema at the value we just signaled,
-    // so the next compute submission carries it through to vkQueueSubmit.
-    //
-    // The cpy_f32_f32 dispatches above put our cross-device writes on the
-    // compute pipeline (avoiding the BMG transfer/L3 issue), but we still
-    // need an explicit semaphore wait between this allreduce's submissions
-    // and the next subgraph's compute submission: same-queue submit batches
-    // are NOT implicitly memory-ordered, and there's no other path that
-    // would carry the dependency. Doing this here keeps the contract local —
-    // the only outside party that needs to know about allreduce_tl_sema is
-    // allreduce itself.
-    for (size_t j = 0; j < n_backends; j++) {
-        auto * ctx = ctxs[j];
-        auto & dev = ctx->device;
-        std::lock_guard<std::recursive_mutex> guard(dev->mutex);
-        GGML_ASSERT(ctx->compute_ctx.expired());  // Step 1 reset it.
-        vk_context next_ctx = ggml_vk_get_compute_ctx(ctx);
-        next_ctx->s->wait_semaphores.push_back({dev->allreduce_tl_sema, dev->allreduce_tl_value});
-
-        // Cross-device WAR on our scratch.  Each butterfly round with
-        // read_local=FALSE has peer (j ^ (1<<br)) reading our scratch[0..nbytes]
-        // cross-device; the next allreduce will write the same range in pre-fold
-        // and/or in butterfly rounds with read_local=TRUE.  For every FALSE round
-        // except the LAST butterfly round, the within-N WAR wait (the `br >= 1`
-        // block in the butterfly above) already issues a wait on that peer's
-        // signal in the next round, so the chain is closed via our own +final
-        // signal — no handover wait needed for those.
-        //
-        // The LAST butterfly round, if read_local=FALSE, has no following round
-        // to issue the WAR wait, so a peer doing one final cross-device scratch
-        // read can still be in flight when our next pre-fold starts writing the
-        // same offset.  Cover that case here with a single peer-wait.
-        //
-        // Excess devices (j >= n_pow2) never write scratch in any allreduce,
-        // so they don't need a peer wait.
+        // Cross-device WAR carryover: in the prior allreduce, our last
+        // butterfly round's peer may have done a cross-device read of our
+        // scratch (when prior last_read_local was FALSE) that's still in
+        // flight. This allreduce will write that same scratch range in
+        // pre-fold and/or in butterfly rounds with read_local=TRUE. Wait on
+        // that peer's prior-final signal before any of this allreduce's
+        // writes start; the wait sits on the FIRST sub of this device's
+        // vkQueueSubmit so intra-vkQueueSubmit "second synchronization
+        // scope" semantics defer every later sub's execution until it
+        // resolves. Excess devices never write scratch and are skipped.
         if (j < n_pow2) {
             const size_t last_sub_idx = is_pow2 ? (n_butterfly_rounds - 1) : n_butterfly_rounds;
             const bool last_read_local = ping_pong_shifted
@@ -15875,10 +15710,40 @@ bool ggml_backend_vk_allreduce_tensor(ggml_backend_t * backends, ggml_tensor ** 
                 const size_t last_br = n_butterfly_rounds - 1;
                 const size_t peer = j ^ ((size_t)1 << last_br);
                 auto & peer_dev = ctxs[peer]->device;
-                vk::Semaphore peer_sema = dev->allreduce_peer_semas[peer_dev->idx];
-                next_ctx->s->wait_semaphores.push_back({peer_sema, peer_dev->allreduce_tl_value});
+                compute_ctx->seqs.front().front().wait_semaphores.push_back({
+                    dev->allreduce_peer_semas[peer_dev->idx],
+                    peer_dev->allreduce_tl_value,
+                });
             }
         }
+
+        // Synchronously do any staging memcpys before submission.
+        for (auto& cpy : compute_ctx->in_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        compute_ctx->in_memcpys.clear();
+
+        // Single vkQueueSubmit per device for this allreduce.
+        ggml_vk_submit(compute_ctx, {});
+        ctx->submit_pending = false;
+
+        // Drop our reference so the next graph_compute (or whatever runs
+        // next on this device) creates a fresh compute_ctx. Ordering of
+        // subsequent submissions against this allreduce's writes is left to
+        // Vulkan submission order + timeline-semaphore monotonicity on
+        // allreduce_tl_sema (which the next allreduce's announce signal
+        // would chain through).
+        ctx->compute_ctx.reset();
+    }
+
+    // Advance per-device CPU-tracked allreduce_tl_value to match the
+    // signals we just submitted. After this, peer_dev->allreduce_tl_value
+    // names the final post-allreduce signal value on each device's timeline,
+    // which is what the next allreduce's announce will wait on as the
+    // cross-device WAR carryover.
+    const uint64_t tl_advance = 1 + n_compute_rounds + (need_final_copy ? 1 : 0);
+    for (size_t j = 0; j < n_backends; j++) {
+        ctxs[j]->device->allreduce_tl_value += tl_advance;
     }
 
     // Periodically wait for GPU and clean up command pools.
